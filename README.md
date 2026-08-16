@@ -50,7 +50,7 @@ _nvdaHttpBridge/
 .\build.ps1
 ```
 
-产物写入 `dist/nvdaHttpBridge-1.1.0.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
+产物写入 `dist/nvdaHttpBridge-1.1.1.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
 
 启动后，写操作 token 位于：
 
