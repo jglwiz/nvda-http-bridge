@@ -8,7 +8,7 @@ import threading
 import time
 from urllib.parse import parse_qs, urlparse
 
-from .auth import extract_token, validate_browser_context, validate_host
+from .auth import validate_browser_context, validate_host
 from .config import (
 	HOST,
 	MAX_ACTIVE_REQUESTS,
@@ -50,6 +50,8 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 		self._active_requests = 0
 		self._request_sockets = set()
 		self._stop_lock = threading.Lock()
+		self._deferred_lock = threading.Lock()
+		self._deferred_callbacks = {}
 		self._stopped = False
 		super().__init__(address, RequestHandler)
 
@@ -83,6 +85,7 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 			raise
 
 	def process_request_thread(self, request, client_address):
+		callback = None
 		try:
 			super().process_request_thread(request, client_address)
 		finally:
@@ -91,6 +94,20 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 				self._active_requests -= 1
 				self._active_condition.notify_all()
 			self._connection_slots.release()
+			with self._deferred_lock:
+				callback = self._deferred_callbacks.pop(request, None)
+			if callback is not None:
+				try:
+					callback()
+				except Exception:
+					if self.logger:
+						self.logger.exception("nvdaHttpBridge: deferred lifecycle callback failed")
+
+	def register_deferred_callback(self, request, callback):
+		with self._deferred_lock:
+			if request in self._deferred_callbacks:
+				raise RuntimeError("A deferred callback is already registered for this request")
+			self._deferred_callbacks[request] = callback
 
 	def start(self):
 		if self._thread and self._thread.is_alive():
@@ -218,7 +235,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 			self._json_response(200, service.capabilities())
 			return
 		if path == "/v1/events":
-			self._auth(sensitive=True)
 			self._sse(params)
 			return
 
@@ -226,22 +242,16 @@ class RequestHandler(BaseHTTPRequestHandler):
 			raise TooManyRequests("The active request limit was reached")
 		try:
 			if path == "/v1/settings/categories":
-				self._auth(sensitive=True)
 				self._json_response(200, service.settings_categories())
 			elif path == "/v1/settings/general":
-				self._auth(sensitive=True)
 				self._json_response(200, service.general_settings())
 			elif path == "/v1/speech-dictionaries":
-				self._auth(sensitive=True)
 				self._json_response(200, service.speech_dictionary_list())
 			elif (match := _SPEECH_DICTIONARY_ROUTE.match(path)) and not match.group(2):
-				self._auth(sensitive=True)
 				self._json_response(200, service.speech_dictionary(match.group(1)))
 			elif (match := _SYMBOL_DICTIONARY_ROUTE.match(path)):
-				self._auth(sensitive=True)
 				self._json_response(200, service.symbol_dictionary(match.group(1)))
 			elif path == "/v1/gestures":
-				self._auth(sensitive=True)
 				unknown = sorted(set(params) - {"context", "filter"})
 				if unknown:
 					raise BadRequest("Unknown gesture query parameters")
@@ -250,26 +260,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 					self._one(params, "filter"),
 				))
 			elif _OBJECT_ID_ROUTE.match(path):
-				self._auth()
 				object_id = _OBJECT_ID_ROUTE.match(path).group(1)
 				self._json_response(200, service.object_by_id(object_id, params))
 			elif path.startswith("/v1/objects/"):
-				self._auth()
 				root = path.rsplit("/", 1)[-1]
 				self._json_response(200, service.object_snapshot(root, params))
 			elif path == "/v1/tree":
-				self._auth()
 				self._json_response(200, service.tree(params))
 			elif path == "/v1/speech":
-				self._auth(sensitive=True)
 				self._json_response(200, service.speech(self._one(params, "last")))
 			elif path == "/v1/log":
-				self._auth(sensitive=True)
 				self._json_response(200, service.log_tail(self._one(params, "last", 50)))
 			else:
 				match = _EXPORT_ROUTE.match(path)
 				if match:
-					self._auth(sensitive=True)
 					job_id, data_suffix = match.groups()
 					if data_suffix:
 						data_file, length = service.open_export_data(job_id)
@@ -285,7 +289,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 				else:
 					match = _BACKUP_ROUTE.match(path)
 					if match:
-						self._auth(sensitive=True)
 						self._json_response(200, service.backup_status(match.group(1)))
 					else:
 						raise NotFoundError()
@@ -298,22 +301,27 @@ class RequestHandler(BaseHTTPRequestHandler):
 		if not self.server.request_slots.acquire(blocking=False):
 			raise TooManyRequests("The active request limit was reached")
 		try:
+			if path == "/v1/lifecycle/restart":
+				accepted = service.prepare_restart(self._read_json())
+				restart_id = accepted["restartId"]
+				self.server.register_deferred_callback(
+					self.request,
+					lambda: service.schedule_prepared_restart(restart_id),
+				)
+				self._json_response(202, accepted, close=True, flush=True)
+				return
 			match = _SPEECH_DICTIONARY_ROUTE.match(path)
 			if match and match.group(2) == "/validate":
-				self._auth(write=True)
 				self._json_response(200, service.validate_speech_dictionary(match.group(1), self._read_json()))
 				return
 			if path == "/v1/tree/exports":
-				self._auth(write=True, sensitive=True)
 				self._json_response(202, service.create_export(self._read_json()))
 				return
 			if path == "/v1/backups":
-				self._auth(write=True, sensitive=True)
 				self._json_response(202, service.create_backup(self._read_json()))
 				return
 			match = _ACTION_ROUTE.match(path)
 			if match:
-				self._auth(write=True)
 				self._json_response(200, service.action(match.group(1), self._read_json()))
 				return
 			raise NotFoundError()
@@ -325,7 +333,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 		if not self.server.request_slots.acquire(blocking=False):
 			raise TooManyRequests("The active request limit was reached")
 		try:
-			self._auth(write=True)
 			if path == "/v1/settings/general":
 				self._json_response(200, self.server.service.patch_general_settings(self._read_json()))
 				return
@@ -341,7 +348,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 		if not self.server.request_slots.acquire(blocking=False):
 			raise TooManyRequests("The active request limit was reached")
 		try:
-			self._auth(write=True)
 			match = _SPEECH_DICTIONARY_ROUTE.match(path)
 			if match and not match.group(2):
 				self._json_response(200, self.server.service.put_speech_dictionary(match.group(1), self._read_json()))
@@ -358,18 +364,13 @@ class RequestHandler(BaseHTTPRequestHandler):
 		path = urlparse(self.path).path.rstrip("/")
 		match = _EXPORT_ROUTE.match(path)
 		if match and not match.group(2):
-			self._auth(write=True, sensitive=True)
 			self._json_response(202, self.server.service.cancel_export(match.group(1)))
 			return
 		match = _BACKUP_ROUTE.match(path)
 		if match:
-			self._auth(write=True, sensitive=True)
 			self._json_response(202, self.server.service.cancel_backup(match.group(1)))
 			return
 		raise NotFoundError()
-
-	def _auth(self, write=False, sensitive=False):
-		self.server.service.authorize(extract_token(self.headers), write=write, sensitive=sensitive)
 
 	def _read_json(self):
 		if self.headers.get("Transfer-Encoding"):
@@ -454,15 +455,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 		self.wfile.flush()
 		return True
 
-	def _json_response(self, status, data):
+	def _json_response(self, status, data, close=False, flush=False):
 		body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 		self.send_response(status)
 		self.send_header("Content-Type", "application/json; charset=utf-8")
 		self.send_header("Content-Length", str(len(body)))
 		self.send_header("Cache-Control", "no-store")
 		self.send_header("X-Content-Type-Options", "nosniff")
+		if close:
+			self.send_header("Connection", "close")
+			self.close_connection = True
 		self.end_headers()
 		self.wfile.write(body)
+		if flush:
+			self.wfile.flush()
 
 	def _file_response(self, data_file, length, download_name, availability_check, content_type):
 		try:

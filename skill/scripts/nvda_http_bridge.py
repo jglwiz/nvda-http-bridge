@@ -35,7 +35,7 @@ class ClientError(Exception):
 
 
 class RejectRedirects(HTTPRedirectHandler):
-	"""Prevent bearer credentials from following a redirect off loopback."""
+	"""Prevent local Bridge requests from following redirects."""
 
 	def redirect_request(self, request, fp, code, message, headers, new_url):
 		return None
@@ -96,41 +96,17 @@ def response_status(response):
 
 
 class NvdaClient:
-	def __init__(self, base_url, token_file, timeout):
+	def __init__(self, base_url, timeout):
 		self.base_url = base_url
-		self.token_file = token_file
 		self.timeout = timeout
-		# Never proxy or redirect a request carrying the local bearer token.
+		# Never proxy or redirect requests to the local bridge.
 		self.opener = build_opener(ProxyHandler({}), RejectRedirects())
 
-	def _read_token(self):
-		if self.token_file is None:
-			appdata = os.environ.get("APPDATA")
-			if not appdata:
-				raise ClientError("APPDATA is unavailable; pass --token-file")
-			token_root = Path(appdata) / "nvda"
-			paths = (token_root / "nvdaHttpBridge.token",)
-		else:
-			paths = (Path(self.token_file),)
-		last_error = None
-		for path in paths:
-			try:
-				token = path.read_text(encoding="utf-8-sig").strip()
-			except OSError as error:
-				last_error = error
-				continue
-			if token:
-				return token
-			raise ClientError("the NVDA HTTP token file is empty")
-		raise ClientError("unable to read the NVDA HTTP token file") from last_error
-
-	def _request(self, method, path, body=None, auth=False, accept="application/json", extra_headers=None):
+	def _request(self, method, path, body=None, accept="application/json", extra_headers=None):
 		headers = {"Accept": accept}
 		if extra_headers:
 			headers.update(extra_headers)
 		data = None
-		if auth:
-			headers["Authorization"] = "Bearer " + self._read_token()
 		if body is not None:
 			data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 			headers["Content-Type"] = "application/json"
@@ -162,15 +138,11 @@ class NvdaClient:
 			data = None
 		return {"httpStatus": status, "contentType": content_type, "data": data}
 
-	def json(self, method, path, body=None, token_mode="none"):
-		auth = token_mode == "required"
-		result = self._decode_response(self._request(method, path, body=body, auth=auth))
-		if token_mode == "optional" and result["httpStatus"] == 401:
-			result = self._decode_response(self._request(method, path, body=body, auth=True))
-		return result
+	def json(self, method, path, body=None):
+		return self._decode_response(self._request(method, path, body=body))
 
 	def download(self, path, output, accept="application/x-ndjson"):
-		response = self._request("GET", path, auth=True, accept=accept)
+		response = self._request("GET", path, accept=accept)
 		status = response_status(response)
 		if status >= 400:
 			return self._decode_response(response)
@@ -207,7 +179,6 @@ class NvdaClient:
 		response = self._request(
 			"GET",
 			path,
-			auth=True,
 			accept="text/event-stream",
 			extra_headers=headers,
 		)
@@ -372,7 +343,7 @@ def reconcile_unknown_completion(client, result, get_path):
 	error = (result.get("data") or {}).get("error") or {}
 	details = error.get("details") or {}
 	if result.get("httpStatus") == 504 and details.get("completionUnknown") is True:
-		result["reconciliation"] = client.json("GET", get_path, token_mode="required")
+		result["reconciliation"] = client.json("GET", get_path)
 	return result
 
 
@@ -422,13 +393,118 @@ def _healthy_uptime(result):
 	return float(uptime)
 
 
-def run_restart(client, args, sender=send_restart_hotkey, clock=time.monotonic, sleep=time.sleep):
+def _healthy_identity(result):
+	if not is_success(result):
+		return None
+	data = result.get("data") or {}
+	pid = data.get("nvdaProcessId")
+	started = data.get("nvdaStartTime")
+	if (
+		data.get("status") != "ok"
+		or not isinstance(pid, int)
+		or isinstance(pid, bool)
+		or pid <= 0
+		or not isinstance(started, (int, float))
+		or isinstance(started, bool)
+		or started <= 0
+	):
+		return None
+	return {"nvdaProcessId": pid, "nvdaStartTime": float(started)}
+
+
+def _identity_changed(before, after):
+	return (
+		before is not None
+		and after is not None
+		and (
+			before["nvdaProcessId"] != after["nvdaProcessId"]
+			or (
+				before.get("nvdaStartTime") is not None
+				and after.get("nvdaStartTime") is not None
+				and before["nvdaStartTime"] != after["nvdaStartTime"]
+			)
+		)
+	)
+
+
+def _restart_capability(result):
+	if not is_success(result):
+		return None
+	capability = ((result.get("data") or {}).get("lifecycle") or {}).get("restart")
+	if not isinstance(capability, dict):
+		return None
+	if capability.get("endpoint") != "/v1/lifecycle/restart":
+		return None
+	return capability
+
+
+def read_local_nvda_identity():
+	"""Read the single local nvda.exe process identity for legacy Bridge fallback."""
+	if sys.platform != "win32":
+		return None
+	from ctypes import wintypes
+
+	class ProcessEntry32W(ctypes.Structure):
+		_fields_ = [
+			("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+			("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+			("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+			("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+			("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
+		]
+
+	kernel32 = ctypes.windll.kernel32
+	snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+	if snapshot in (0, ctypes.c_void_p(-1).value):
+		return None
+	process_ids = []
+	try:
+		entry = ProcessEntry32W()
+		entry.dwSize = ctypes.sizeof(entry)
+		ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+		while ok:
+			if entry.szExeFile.lower() == "nvda.exe":
+				process_ids.append(int(entry.th32ProcessID))
+			ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+	finally:
+		kernel32.CloseHandle(snapshot)
+	if len(process_ids) != 1:
+		return None
+	return {"nvdaProcessId": process_ids[0], "nvdaStartTime": None}
+
+
+def run_restart(
+	client,
+	args,
+	sender=send_restart_hotkey,
+	clock=time.monotonic,
+	sleep=time.sleep,
+	identity_reader=read_local_nvda_identity,
+):
 	baseline = client.json("GET", "/health")
 	before_uptime = _healthy_uptime(baseline)
+	before_identity = _healthy_identity(baseline)
 	if before_uptime is None:
 		raise ClientError("NVDA HTTP health must be status ok with a numeric uptimeMs before restart")
-
-	sender(args.nvda_key)
+	capabilities = client.json("GET", "/v1/capabilities")
+	capability = _restart_capability(capabilities)
+	if before_identity is None and capability is None:
+		before_identity = identity_reader()
+	if before_identity is None:
+		raise ClientError("NVDA HTTP health must include a valid NVDA process identity before dedicated restart")
+	method = "http" if capability is not None else "externalHotkey"
+	accepted = None
+	post_completion_unknown = False
+	if capability is not None:
+		try:
+			accepted = client.json("POST", capability["endpoint"], {})
+		except ClientError:
+			post_completion_unknown = True
+		else:
+			if accepted.get("httpStatus") != 202:
+				return accepted, 2
+	else:
+		sender(args.nvda_key)
 	started = clock()
 	deadline = started + args.wait_seconds
 	attempts = 0
@@ -444,13 +520,19 @@ def run_restart(client, args, sender=send_restart_hotkey, clock=time.monotonic, 
 			observed_unavailable = True
 		else:
 			after_uptime = _healthy_uptime(last_result)
-			if after_uptime is not None and after_uptime < before_uptime:
+			after_identity = _healthy_identity(last_result)
+			if after_identity is None and capability is None:
+				after_identity = identity_reader()
+			if _identity_changed(before_identity, after_identity):
 				return {
 					"httpStatus": 200,
 					"data": {
 						"status": "restarted",
-						"hotkey": "NVDA+Shift+Q",
-						"nvdaKey": args.nvda_key,
+						"method": method,
+						"restartId": ((accepted or {}).get("data") or {}).get("restartId"),
+						"postCompletionUnknown": post_completion_unknown,
+						"before": before_identity,
+						"after": after_identity,
 						"beforeUptimeMs": before_uptime,
 						"afterUptimeMs": after_uptime,
 						"observedUnavailable": observed_unavailable,
@@ -465,10 +547,12 @@ def run_restart(client, args, sender=send_restart_hotkey, clock=time.monotonic, 
 		"data": {
 			"error": {
 				"code": "restartTimeout",
-				"message": "NVDA HTTP did not return with a lower uptimeMs before the deadline",
+				"message": "NVDA HTTP did not return with a new NVDA process identity before the deadline",
 			},
-			"hotkey": "NVDA+Shift+Q",
-			"nvdaKey": args.nvda_key,
+			"method": method,
+			"restartId": ((accepted or {}).get("data") or {}).get("restartId"),
+			"postCompletionUnknown": post_completion_unknown,
+			"before": before_identity,
 			"beforeUptimeMs": before_uptime,
 			"observedUnavailable": observed_unavailable,
 			"attempts": attempts,
@@ -483,7 +567,7 @@ def run_backup(client, args):
 	if output.exists():
 		raise ClientError("refusing to overwrite the backup destination: %s" % output)
 
-	created = client.json("POST", "/v1/backups", {"targetPath": str(target)}, "required")
+	created = client.json("POST", "/v1/backups", {"targetPath": str(target)})
 	if not is_success(created):
 		return created, 2
 	job_id = job_id_from(created)
@@ -494,7 +578,7 @@ def run_backup(client, args):
 	try:
 		deadline = time.monotonic() + args.wait_seconds
 		while time.monotonic() < deadline:
-			terminal = client.json("GET", "/v1/backups/" + quote(job_id, safe=""), token_mode="required")
+			terminal = client.json("GET", "/v1/backups/" + quote(job_id, safe=""))
 			if not is_success(terminal):
 				break
 			if (terminal.get("data") or {}).get("status") in TERMINAL_EXPORT_STATES:
@@ -518,7 +602,7 @@ def run_backup(client, args):
 			backup_bytes = terminal_data.get("bytes")
 	finally:
 		try:
-			cleanup = client.json("DELETE", "/v1/backups/" + quote(job_id, safe=""), token_mode="required")
+			cleanup = client.json("DELETE", "/v1/backups/" + quote(job_id, safe=""))
 		except ClientError as error:
 			cleanup = {
 				"httpStatus": 0,
@@ -559,7 +643,7 @@ def run_backup(client, args):
 
 
 def run_export(client, args):
-	created = client.json("POST", "/v1/tree/exports", export_body(args), "required")
+	created = client.json("POST", "/v1/tree/exports", export_body(args))
 	if not is_success(created):
 		return created, 2
 	job_id = job_id_from(created)
@@ -569,7 +653,7 @@ def run_export(client, args):
 	try:
 		deadline = time.monotonic() + args.wait_seconds
 		while time.monotonic() < deadline:
-			status = client.json("GET", "/v1/tree/exports/" + quote(job_id, safe=""), token_mode="required")
+			status = client.json("GET", "/v1/tree/exports/" + quote(job_id, safe=""))
 			if not is_success(status):
 				terminal = status
 				break
@@ -600,7 +684,6 @@ def run_export(client, args):
 				cleanup = client.json(
 					"DELETE",
 					"/v1/tree/exports/" + quote(job_id, safe=""),
-					token_mode="required",
 				)
 			except ClientError as error:
 				cleanup = {
@@ -653,7 +736,6 @@ def run_export(client, args):
 def build_parser():
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("--base-url", type=validate_base_url, default=DEFAULT_BASE_URL)
-	parser.add_argument("--token-file", type=Path)
 	parser.add_argument("--timeout", type=float, default=8.0)
 	sub = parser.add_subparsers(dest="command", required=True)
 
@@ -745,33 +827,33 @@ def execute(client, args):
 		return client.json("GET", "/health" if command == "health" else "/v1/" + command), None
 	if command == "object":
 		path = query_path("/v1/objects/" + args.root, {"include": args.include})
-		return client.json("GET", path, token_mode="optional"), None
+		return client.json("GET", path), None
 	if command == "object-id":
 		path = query_path("/v1/objects/by-id/" + quote(args.object_id, safe=""), {"include": args.include})
-		return client.json("GET", path, token_mode="optional"), None
+		return client.json("GET", path), None
 	if command == "tree":
-		return client.json("GET", query_path("/v1/tree", tree_params(args)), token_mode="optional"), None
+		return client.json("GET", query_path("/v1/tree", tree_params(args))), None
 	if command in ("speech-history", "log-tail"):
 		path = "/v1/speech" if command == "speech-history" else "/v1/log"
-		return client.json("GET", query_path(path, {"last": args.last}), token_mode="required"), None
+		return client.json("GET", query_path(path, {"last": args.last})), None
 	if command == "events":
 		return client.events(args.types, args.duration, args.max_events, args.last_event_id), None
 	if command == "export-create":
-		return client.json("POST", "/v1/tree/exports", export_body(args), "required"), None
+		return client.json("POST", "/v1/tree/exports", export_body(args)), None
 	if command == "export-status":
-		return client.json("GET", "/v1/tree/exports/" + quote(args.job_id, safe=""), token_mode="required"), None
+		return client.json("GET", "/v1/tree/exports/" + quote(args.job_id, safe="")), None
 	if command == "export-cancel":
-		return client.json("DELETE", "/v1/tree/exports/" + quote(args.job_id, safe=""), token_mode="required"), None
+		return client.json("DELETE", "/v1/tree/exports/" + quote(args.job_id, safe="")), None
 	if command == "export-download":
 		return client.download("/v1/tree/exports/%s/data" % quote(args.job_id, safe=""), args.output), None
 	if command == "export-run":
 		return run_export(client, args)
 	if command == "speak":
-		return client.json("POST", "/v1/actions/speak", {"text": args.text}, "required"), None
+		return client.json("POST", "/v1/actions/speak", {"text": args.text}), None
 	if command == "cancel-speech":
-		return client.json("POST", "/v1/actions/cancel-speech", {}, "required"), None
+		return client.json("POST", "/v1/actions/cancel-speech", {}), None
 	if command == "gesture":
-		return client.json("POST", "/v1/actions/gesture", {"key": args.key}, "required"), None
+		return client.json("POST", "/v1/actions/gesture", {"key": args.key}), None
 	if command == "restart":
 		return run_restart(client, args)
 	if command == "backup-create":
@@ -779,12 +861,11 @@ def execute(client, args):
 			"POST",
 			"/v1/backups",
 			{"targetPath": str(args.output.expanduser().resolve())},
-			"required",
 		), None
 	if command == "backup-status":
-		return client.json("GET", "/v1/backups/" + quote(args.job_id, safe=""), token_mode="required"), None
+		return client.json("GET", "/v1/backups/" + quote(args.job_id, safe="")), None
 	if command == "backup-cancel":
-		return client.json("DELETE", "/v1/backups/" + quote(args.job_id, safe=""), token_mode="required"), None
+		return client.json("DELETE", "/v1/backups/" + quote(args.job_id, safe="")), None
 	if command == "backup":
 		return run_backup(client, args)
 	if command in ("focus-object", "default-action"):
@@ -792,40 +873,40 @@ def execute(client, args):
 		if args.generation:
 			body["generation"] = args.generation
 		action = "focus" if command == "focus-object" else "default-action"
-		return client.json("POST", "/v1/actions/" + action, body, "required"), None
+		return client.json("POST", "/v1/actions/" + action, body), None
 	if command == "settings-categories":
-		return client.json("GET", "/v1/settings/categories", token_mode="required"), None
+		return client.json("GET", "/v1/settings/categories"), None
 	if command == "settings-get":
-		return client.json("GET", "/v1/settings/general", token_mode="required"), None
+		return client.json("GET", "/v1/settings/general"), None
 	if command == "settings-set":
-		result = client.json("PATCH", "/v1/settings/general", read_json_file(args.body_file), "required")
+		result = client.json("PATCH", "/v1/settings/general", read_json_file(args.body_file))
 		return reconcile_unknown_completion(client, result, "/v1/settings/general"), None
 	if command == "speech-dictionaries":
-		return client.json("GET", "/v1/speech-dictionaries", token_mode="required"), None
+		return client.json("GET", "/v1/speech-dictionaries"), None
 	if command == "speech-dictionary-get":
 		path = "/v1/speech-dictionaries/" + quote(args.dictionary_id, safe="")
-		return client.json("GET", path, token_mode="required"), None
+		return client.json("GET", path), None
 	if command in ("speech-dictionary-validate", "speech-dictionary-put"):
 		path = "/v1/speech-dictionaries/" + quote(args.dictionary_id, safe="")
 		method = "POST" if command.endswith("validate") else "PUT"
 		if method == "POST":
 			path += "/validate"
-		result = client.json(method, path, read_json_file(args.body_file), "required")
+		result = client.json(method, path, read_json_file(args.body_file))
 		if method == "PUT":
 			result = reconcile_unknown_completion(client, result, path)
 		return result, None
 	if command == "symbols-get":
 		path = "/v1/symbol-dictionaries/" + quote(args.locale, safe="")
-		return client.json("GET", path, token_mode="required"), None
+		return client.json("GET", path), None
 	if command == "symbols-put":
 		path = "/v1/symbol-dictionaries/" + quote(args.locale, safe="")
-		result = client.json("PUT", path, read_json_file(args.body_file), "required")
+		result = client.json("PUT", path, read_json_file(args.body_file))
 		return reconcile_unknown_completion(client, result, path), None
 	if command == "gestures-get":
 		path = query_path("/v1/gestures", {"context": "current", "filter": args.filter})
-		return client.json("GET", path, token_mode="required"), None
+		return client.json("GET", path), None
 	if command == "gestures-patch":
-		result = client.json("PATCH", "/v1/gestures", read_json_file(args.body_file), "required")
+		result = client.json("PATCH", "/v1/gestures", read_json_file(args.body_file))
 		return reconcile_unknown_completion(client, result, "/v1/gestures?context=current"), None
 	raise ClientError("unsupported command")
 
@@ -843,7 +924,7 @@ def main(argv=None):
 		parser.error("--duration must be between 0.1 and 60 seconds")
 	if hasattr(args, "max_events") and not 1 <= args.max_events <= 1000:
 		parser.error("--max-events must be between 1 and 1000")
-	client = NvdaClient(args.base_url, args.token_file, args.timeout)
+	client = NvdaClient(args.base_url, args.timeout)
 	try:
 		result, explicit_exit = execute(client, args)
 	except ClientError as error:

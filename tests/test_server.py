@@ -1,6 +1,7 @@
 import http.client
 import io
 import json
+import time
 import unittest
 
 from support import GLOBAL_PLUGINS  # noqa: F401
@@ -12,20 +13,18 @@ from _nvdaHttpBridge.server import BoundedHTTPServer
 class FakeService:
 	def __init__(self):
 		self.health_calls = 0
-		self.authorize_calls = []
 		self.download_calls = []
 		self.download_error = None
 		self.download_bytes = b'{"object":{"name":"root"}}\n'
 		self.download_handle = None
 		self.backup_calls = []
 		self.configuration_calls = []
+		self.restart_calls = []
+		self.server = None
 
 	def health(self):
 		self.health_calls += 1
 		return {"status": "ok", "source": "fake"}
-
-	def authorize(self, token, write=False, sensitive=False):
-		self.authorize_calls.append((token, write, sensitive))
 
 	def open_export_data(self, job_id):
 		self.download_calls.append(job_id)
@@ -65,6 +64,20 @@ class FakeService:
 		self.configuration_calls.append(("speech-validate", dictionary_id, body))
 		return {"valid": True}
 
+	def prepare_restart(self, body):
+		self.restart_calls.append(("prepare", body))
+		return {
+			"status": "accepted",
+			"restartId": "restart-1",
+			"before": {"nvdaProcessId": 1, "nvdaStartTime": 2.0, "bridgeUptimeMs": 3.0},
+		}
+
+	def schedule_prepared_restart(self, restart_id):
+		with self.server._active_condition:
+			active = self.server._active_requests
+		self.restart_calls.append(("scheduled", restart_id, active))
+		return True
+
 
 class BoundedHTTPServerTests(unittest.TestCase):
 	def setUp(self):
@@ -74,6 +87,7 @@ class BoundedHTTPServerTests(unittest.TestCase):
 			address=("127.0.0.1", 0),
 		)
 		self.server.start()
+		self.service.server = self.server
 		self.host, self.port = self.server.server_address
 
 	def tearDown(self):
@@ -178,7 +192,6 @@ class BoundedHTTPServerTests(unittest.TestCase):
 		self.assertIsNone(response.getheader("Content-Disposition"))
 		self.assertEqual("conflict", body["error"]["code"])
 		self.assertEqual(["job-1"], self.service.download_calls)
-		self.assertEqual([("", False, True)], self.service.authorize_calls)
 
 	def test_export_download_uses_open_handle_length_and_closes_it(self):
 		connection = self.connection()
@@ -196,14 +209,14 @@ class BoundedHTTPServerTests(unittest.TestCase):
 		self.assertEqual(["job-2"], self.service.download_calls)
 		self.assertTrue(self.service.download_handle.closed)
 
-	def test_backup_lifecycle_routes_require_write_or_sensitive_auth(self):
+	def test_backup_lifecycle_routes_work_without_authentication(self):
 		connection = self.connection()
 		try:
 			connection.request(
 				"POST",
 				"/v1/backups",
 				body='{"targetPath":"D:/backups"}',
-				headers={"Content-Type": "application/json", "Authorization": "Bearer token"},
+				headers={"Content-Type": "application/json"},
 			)
 			created_response = connection.getresponse()
 			created = json.loads(created_response.read().decode("utf-8"))
@@ -223,8 +236,29 @@ class BoundedHTTPServerTests(unittest.TestCase):
 		self.assertIn(("create", {"targetPath": "D:/backups"}), self.service.backup_calls)
 		self.assertIn(("status", "backup-created"), self.service.backup_calls)
 		self.assertIn(("cancel", "backup-created"), self.service.backup_calls)
-		self.assertIn(("token", True, True), self.service.authorize_calls)
-		self.assertIn(("", False, True), self.service.authorize_calls)
+
+	def test_restart_response_is_complete_and_request_released_before_callback(self):
+		connection = self.connection()
+		try:
+			connection.request(
+				"POST",
+				"/v1/lifecycle/restart",
+				body="{}",
+				headers={"Content-Type": "application/json"},
+			)
+			response = connection.getresponse()
+			payload = json.loads(response.read().decode("utf-8"))
+		finally:
+			connection.close()
+		for _unused in range(100):
+			if any(call[0] == "scheduled" for call in self.service.restart_calls):
+				break
+			time.sleep(0.01)
+
+		self.assertEqual(202, response.status)
+		self.assertEqual("close", response.getheader("Connection"))
+		self.assertEqual("restart-1", payload["restartId"])
+		self.assertEqual([("prepare", {}), ("scheduled", "restart-1", 0)], self.service.restart_calls)
 
 	def test_unknown_routes_return_not_found(self):
 		for method, path, body in (
@@ -243,9 +277,9 @@ class BoundedHTTPServerTests(unittest.TestCase):
 				self.assertEqual(404, response.status)
 				self.assertEqual("notFound", payload["error"]["code"])
 
-	def test_configuration_routes_use_explicit_methods_and_require_token(self):
+	def test_configuration_routes_use_explicit_methods_without_authentication(self):
 		connection = self.connection()
-		headers = {"Content-Type": "application/json", "Authorization": "Bearer token"}
+		headers = {"Content-Type": "application/json"}
 		try:
 			connection.request("GET", "/v1/settings/general", headers=headers)
 			get_response = connection.getresponse()
@@ -264,8 +298,6 @@ class BoundedHTTPServerTests(unittest.TestCase):
 		self.assertEqual([200, 200, 200, 200], [get_response.status, patch_response.status, validate_response.status, put_response.status])
 		self.assertIn(("general-get",), self.service.configuration_calls)
 		self.assertIn(("speech-put", "default", {"baseRevision": "d1", "entries": []}), self.service.configuration_calls)
-		self.assertIn(("token", False, True), self.service.authorize_calls)
-		self.assertIn(("token", True, False), self.service.authorize_calls)
 
 
 if __name__ == "__main__":

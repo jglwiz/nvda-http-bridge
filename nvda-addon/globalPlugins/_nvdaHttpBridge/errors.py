@@ -24,12 +24,6 @@ class BadRequest(BridgeError):
 	default_message = "The request is invalid"
 
 
-class Unauthorized(BridgeError):
-	status = 401
-	code = "unauthorized"
-	default_message = "A valid local session token is required"
-
-
 class Forbidden(BridgeError):
 	status = 403
 	code = "forbidden"
@@ -57,6 +51,16 @@ class Conflict(BridgeError):
 class StaleState(Conflict):
 	code = "staleState"
 	default_message = "The resource changed since it was read"
+
+
+class RestartBlocked(Conflict):
+	code = "restartBlocked"
+	default_message = "NVDA cannot be safely restarted in the current UI state"
+
+
+class RestartAlreadyScheduled(Conflict):
+	code = "restartAlreadyScheduled"
+	default_message = "An NVDA restart is already scheduled"
 
 
 class PartialFailure(BridgeError):

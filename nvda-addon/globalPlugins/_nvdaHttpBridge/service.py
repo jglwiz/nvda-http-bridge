@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 
 from .auth import RateLimiter
 from .config import (
@@ -43,7 +44,6 @@ from .config import (
 	PLUGIN_VERSION,
 	PORT,
 	PROTOCOL_VERSION,
-	REQUIRE_READ_TOKEN,
 	ROOT_NAMES,
 	SYNC_BATCH_BUDGET_MS,
 	SYNC_BATCH_NODES,
@@ -57,6 +57,7 @@ from .config import (
 from .errors import (
 	BadRequest,
 	NotFound,
+	RestartAlreadyScheduled,
 	SecureContext,
 	TooManyRequests,
 	UnsafeAction,
@@ -75,7 +76,6 @@ class BridgeService:
 		events,
 		speech_observer,
 		exports,
-		tokens,
 		security_state,
 		backups=None,
 		settings=None,
@@ -83,6 +83,7 @@ class BridgeService:
 		symbol_dictionaries=None,
 		gestures=None,
 		monotonic=None,
+		logger=None,
 	):
 		self.adapter = adapter
 		self.executor = executor
@@ -90,7 +91,6 @@ class BridgeService:
 		self.events = events
 		self.speech_observer = speech_observer
 		self.exports = exports
-		self.tokens = tokens
 		self.security_state = security_state
 		self.backups = backups
 		self.settings = settings
@@ -98,6 +98,7 @@ class BridgeService:
 		self.symbol_dictionaries = symbol_dictionaries
 		self.gestures = gestures
 		self._monotonic = monotonic or time.monotonic
+		self._logger = logger
 		self._started_at = self._monotonic()
 		self._closing = False
 		self._closed = False
@@ -113,11 +114,10 @@ class BridgeService:
 			monotonic=self._monotonic,
 		)
 		self._tree_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SYNC_TREES)
+		self._restart_lock = threading.Lock()
+		self._pending_restart = None
+		self._restart_dispatched = False
 		self._event_generation = self.registry.new_generation()
-
-	def authorize(self, token, write=False, sensitive=False):
-		if write or sensitive or REQUIRE_READ_TOKEN:
-			self.tokens.authorize(token)
 
 	def assert_data_available(self):
 		if self._closing:
@@ -138,11 +138,17 @@ class BridgeService:
 		else:
 			main_thread_state = "unknown"
 		status = "closing" if self._closing else ("degraded" if main_thread_state == "unavailable" else "ok")
+		identity = self.adapter.nvda_identity()
+		with self._restart_lock:
+			restart_pending = self._pending_restart is not None
 		return {
 			"status": status,
 			"protocolVersion": PROTOCOL_VERSION,
 			"pluginVersion": PLUGIN_VERSION,
 			"uptimeMs": round((self._monotonic() - self._started_at) * 1000, 2),
+			"nvdaProcessId": identity["nvdaProcessId"],
+			"nvdaStartTime": identity["nvdaStartTime"],
+			"restartPending": restart_pending,
 			"security": self.security_state.snapshot(),
 			"mainThread": {"state": main_thread_state},
 			"executor": executor_metrics,
@@ -152,10 +158,13 @@ class BridgeService:
 		}
 
 	def version(self):
+		identity = self.adapter.nvda_identity()
 		return {
 			"plugin": {"name": "nvdaHttpBridge", "version": PLUGIN_VERSION},
 			"protocolVersion": PROTOCOL_VERSION,
 			"nvda": self.adapter.version(),
+			"nvdaProcessId": identity["nvdaProcessId"],
+			"nvdaStartTime": identity["nvdaStartTime"],
 			"python": sys.version.split()[0],
 		}
 
@@ -163,12 +172,7 @@ class BridgeService:
 		return {
 			"protocolVersion": PROTOCOL_VERSION,
 			"listen": {"host": HOST, "port": PORT, "loopbackOnly": True},
-			"auth": {
-				"readTokenRequired": REQUIRE_READ_TOKEN,
-				"writeTokenRequired": True,
-				"sensitiveReadTokenRequired": True,
-				"tokenFile": os.path.basename(self.tokens.path),
-			},
+			"auth": {"mode": "none"},
 			"roots": list(ROOT_NAMES),
 			"fields": list(ALLOWED_FIELDS),
 			"treeFormats": list(TREE_FORMATS),
@@ -229,6 +233,17 @@ class BridgeService:
 				"speechDictionaries": "/v1/speech-dictionaries",
 				"symbolDictionaries": "/v1/symbol-dictionaries/{locale}",
 				"gestures": "/v1/gestures",
+				"lifecycleRestart": "/v1/lifecycle/restart",
+			},
+			"lifecycle": {
+				"restart": {
+					"endpoint": "/v1/lifecycle/restart",
+					"execution": "processBoundaryAsync",
+					"responseStatus": 202,
+					"requestBody": "emptyObject",
+					"verification": "nvdaProcessIdentity",
+					"legacyFallback": "externalNvdaShiftQWhenCapabilityAbsent",
+				},
 			},
 			"configurationResources": {
 				"settings/general": {
@@ -472,6 +487,49 @@ class BridgeService:
 	def cancel_backup(self, job_id):
 		return self.backups.cancel(job_id)
 
+	def prepare_restart(self, body):
+		self.assert_data_available()
+		if not isinstance(body, dict):
+			raise ValidationError("The restart body must be an empty JSON object")
+		if body:
+			raise ValidationError("The restart body must be an empty JSON object", details={"unknown": sorted(body)})
+		self._rate_limiter.check("restart")
+		self.executor.call(self.adapter.assert_restart_allowed, 1000)
+		identity = self.adapter.nvda_identity()
+		before = {
+			"nvdaProcessId": identity["nvdaProcessId"],
+			"nvdaStartTime": identity["nvdaStartTime"],
+			"bridgeUptimeMs": round((self._monotonic() - self._started_at) * 1000, 2),
+		}
+		restart_id = uuid.uuid4().hex
+		with self._restart_lock:
+			if self._pending_restart is not None:
+				raise RestartAlreadyScheduled()
+			self._pending_restart = restart_id
+		return {"status": "accepted", "restartId": restart_id, "before": before}
+
+	def schedule_prepared_restart(self, restart_id):
+		with self._restart_lock:
+			if self._pending_restart != restart_id or self._restart_dispatched:
+				return False
+			self._restart_dispatched = True
+			# Keep the reservation set until this process exits. A second request must
+			# never schedule another lifecycle action if shutdown is slow or fails.
+		def restart_work():
+			try:
+				self.adapter.restart()
+			except Exception:
+				if self._logger is not None:
+					self._logger.exception(
+						"nvdaHttpBridge: native restart failed restartId=%s",
+						restart_id,
+					)
+				else:
+					raise
+
+		self.adapter.schedule(restart_work)
+		return True
+
 	def action(self, action_name, body):
 		self.assert_data_available()
 		if not isinstance(body, dict):
@@ -540,9 +598,9 @@ class BridgeService:
 		elif normalized.startswith("kb(") and "):" in normalized:
 			normalized = normalized.split("):", 1)[1]
 		aliases = {"ctrl": "control", "capslock": "nvda", "insert": "nvda", "numpadinsert": "nvda"}
-		tokens = {aliases.get(token, token) for token in normalized.split("+") if token}
+		parts = {aliases.get(part, part) for part in normalized.split("+") if part}
 		for blocked in BLOCKED_GESTURE_CHORDS:
-			if set(blocked).issubset(tokens):
+			if set(blocked).issubset(parts):
 				raise UnsafeAction("This gesture can reload or terminate NVDA")
 
 	def capture_event(self, event_type, obj):

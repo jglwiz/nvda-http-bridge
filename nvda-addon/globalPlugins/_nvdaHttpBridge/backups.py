@@ -13,10 +13,10 @@ from .config import (
 	BACKUP_MAX_DURATION_SECONDS,
 	BACKUP_REAPER_INTERVAL_SECONDS,
 	BACKUP_TTL_SECONDS,
-	TOKEN_FILE_NAME,
+	LEGACY_CREDENTIAL_FILE_NAME,
 )
 from .errors import Conflict, NotFound, SecureContext, ServiceUnavailable, TooManyRequests
-from .ids import token_urlsafe
+from .ids import random_urlsafe
 
 
 def _utc_after(seconds=0.0):
@@ -117,7 +117,7 @@ class BackupManager:
 				raise TooManyRequests("An NVDA backup is already running")
 			if os.path.lexists(backup_path):
 				raise Conflict("The NVDA backup path already exists")
-			job_id = token_urlsafe(18)
+			job_id = random_urlsafe(18)
 			job = BackupJob(
 				job_id,
 				target_path,
@@ -211,7 +211,7 @@ class BackupManager:
 	@staticmethod
 	def _remove_credentials(backup_path):
 		config_path = os.path.join(backup_path, "userConfig")
-		for name in (TOKEN_FILE_NAME, "nvdaHttpBridge-exports"):
+		for name in (LEGACY_CREDENTIAL_FILE_NAME, "nvdaHttpBridge-exports"):
 			path = os.path.join(config_path, name)
 			try:
 				if os.path.isdir(path):

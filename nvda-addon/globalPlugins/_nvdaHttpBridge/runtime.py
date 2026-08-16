@@ -2,7 +2,7 @@
 
 import threading
 
-from .auth import SecurityState, TokenManager
+from .auth import SecurityState
 from .backups import BackupManager
 from .events import EventBuffer, SpeechObserver
 from .executor import MainThreadExecutor
@@ -24,7 +24,6 @@ class BridgeRuntime:
 		self.adapter = NvdaAdapter(self.security)
 		initial = self.adapter.initial_security_state()
 		self.security.update(**initial)
-		self.tokens = TokenManager(self.adapter.config_path)
 		capture_enabled = not self.security.restricted()
 		self.events = EventBuffer(enabled=capture_enabled)
 		self.speech = SpeechObserver(
@@ -59,13 +58,13 @@ class BridgeRuntime:
 			self.events,
 			self.speech,
 			self.exports,
-			self.tokens,
 			self.security,
 			backups=self.backups,
 			settings=self.settings,
 			speech_dictionaries=self.speech_dictionaries,
 			symbol_dictionaries=self.symbol_dictionaries,
 			gestures=self.gestures,
+			logger=self.log,
 		)
 		self.server = None
 		self._registered = []
@@ -92,7 +91,6 @@ class BridgeRuntime:
 			with self._lock:
 				self._started = True
 			self.log.info("nvdaHttpBridge: started on 127.0.0.1:%s", self.server.server_address[1])
-			self.log.info("nvdaHttpBridge: action token stored at %s", self.tokens.path)
 		except Exception:
 			self.close()
 			raise

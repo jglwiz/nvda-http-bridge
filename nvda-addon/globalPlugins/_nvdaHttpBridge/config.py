@@ -2,7 +2,7 @@
 
 HOST = "127.0.0.1"
 PORT = 19281
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.3.0"
 PROTOCOL_VERSION = "1.0"
 
 SPEECH_BUFFER_SIZE = 100
@@ -76,8 +76,8 @@ MAX_SSE_CLIENTS = 2
 SOCKET_TIMEOUT_SECONDS = 5.0
 SERVER_JOIN_TIMEOUT_SECONDS = 3.0
 
-TOKEN_FILE_NAME = "nvdaHttpBridge.token"
-REQUIRE_READ_TOKEN = False
+# Retained only so backups can omit a credential file left by older releases.
+LEGACY_CREDENTIAL_FILE_NAME = "nvdaHttpBridge.token"
 
 # These gestures can terminate or reload the plugin while its own HTTP
 # request is still in flight. Modifier order is normalized by the service.

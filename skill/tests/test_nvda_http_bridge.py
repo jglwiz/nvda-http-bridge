@@ -12,8 +12,21 @@ nvda_http = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(nvda_http)
 
 
-def health(uptime, status="ok"):
-	return {"httpStatus": 200, "data": {"status": status, "uptimeMs": uptime}}
+def health(uptime, status="ok", pid=10, started=100.0):
+	return {
+		"httpStatus": 200,
+		"data": {
+			"status": status,
+			"uptimeMs": uptime,
+			"nvdaProcessId": pid,
+			"nvdaStartTime": started,
+		},
+	}
+
+
+def capabilities(restart=True):
+	data = {"lifecycle": {"restart": {"endpoint": "/v1/lifecycle/restart"}}} if restart else {}
+	return {"httpStatus": 200, "data": data}
 
 
 class FakeClock:
@@ -32,23 +45,11 @@ class SequenceClient:
 		self.responses = iter(responses)
 		self.timeout = 8.0
 
-	def json(self, method, path):
+	def json(self, method, path, body=None):
 		response = next(self.responses)
 		if isinstance(response, Exception):
 			raise response
 		return response
-
-
-class TokenFileTests(unittest.TestCase):
-	def test_default_token_uses_the_canonical_name(self):
-		with tempfile.TemporaryDirectory() as temporary:
-			token_root = Path(temporary) / "nvda"
-			token_root.mkdir()
-			(token_root / "nvdaHttpBridge.token").write_text("current-token", encoding="ascii")
-			client = nvda_http.NvdaClient("http://127.0.0.1:19281", None, 1.0)
-
-			with patch.dict(nvda_http.os.environ, {"APPDATA": temporary}):
-				self.assertEqual("current-token", client._read_token())
 
 
 class ClientTransportTests(unittest.TestCase):
@@ -78,8 +79,8 @@ class ConfigurationCommandTests(unittest.TestCase):
 			self.calls = []
 			self.first = first
 
-		def json(self, method, path, body=None, token_mode="none"):
-			self.calls.append((method, path, body, token_mode))
+		def json(self, method, path, body=None):
+			self.calls.append((method, path, body))
 			if len(self.calls) == 1 and self.first is not None:
 				return self.first
 			return {"httpStatus": 200, "data": {"revision": "actual"}}
@@ -108,11 +109,13 @@ class ConfigurationCommandTests(unittest.TestCase):
 
 
 class RestartTests(unittest.TestCase):
-	def test_restart_sends_external_hotkey_and_requires_lower_uptime(self):
+	def test_restart_uses_http_once_and_requires_new_process_identity(self):
 		client = SequenceClient([
 			health(10000),
+			capabilities(),
+			{"httpStatus": 202, "data": {"status": "accepted", "restartId": "r1"}},
 			nvda_http.ClientError("bridge unavailable"),
-			health(250),
+			health(250, pid=11, started=101.0),
 		])
 		args = nvda_http.build_parser().parse_args(["restart"])
 		clock = FakeClock()
@@ -127,8 +130,10 @@ class RestartTests(unittest.TestCase):
 		)
 
 		self.assertEqual(0, exit_code)
-		self.assertEqual(["insert"], sent)
+		self.assertEqual([], sent)
 		self.assertEqual("restarted", result["data"]["status"])
+		self.assertEqual("http", result["data"]["method"])
+		self.assertEqual("r1", result["data"]["restartId"])
 		self.assertEqual(10000.0, result["data"]["beforeUptimeMs"])
 		self.assertEqual(250.0, result["data"]["afterUptimeMs"])
 		self.assertTrue(result["data"]["observedUnavailable"])
@@ -138,8 +143,12 @@ class RestartTests(unittest.TestCase):
 		class StableClient:
 			timeout = 8.0
 
-			def json(self, method, path):
-				return health(10000)
+			def json(self, method, path, body=None):
+				if path == "/v1/capabilities":
+					return capabilities()
+				if method == "POST":
+					return {"httpStatus": 202, "data": {"restartId": "r1"}}
+				return health(100 if method == "GET" else 10000)
 
 		args = nvda_http.build_parser().parse_args([
 			"restart",
@@ -158,6 +167,42 @@ class RestartTests(unittest.TestCase):
 		self.assertEqual(2, exit_code)
 		self.assertEqual(408, result["httpStatus"])
 		self.assertEqual("restartTimeout", result["data"]["error"]["code"])
+
+	def test_uptime_reset_without_identity_change_is_not_success(self):
+		client = SequenceClient([
+			health(10000), capabilities(), {"httpStatus": 202, "data": {"restartId": "r1"}},
+			health(10), health(20),
+		])
+		args = nvda_http.build_parser().parse_args(["restart", "--wait-seconds", "0.2", "--poll-interval", "0.1"])
+		clock = FakeClock()
+		result, exit_code = nvda_http.run_restart(client, args, clock=clock, sleep=clock.sleep)
+		self.assertEqual(2, exit_code)
+		self.assertEqual("restartTimeout", result["data"]["error"]["code"])
+
+	def test_old_bridge_without_capability_uses_external_hotkey(self):
+		client = SequenceClient([
+			health(10000), capabilities(False), health(200, pid=11, started=101.0),
+		])
+		args = nvda_http.build_parser().parse_args(["restart"])
+		clock = FakeClock()
+		sent = []
+		result, exit_code = nvda_http.run_restart(client, args, sender=sent.append, clock=clock, sleep=clock.sleep)
+		self.assertEqual(0, exit_code)
+		self.assertEqual(["insert"], sent)
+		self.assertEqual("externalHotkey", result["data"]["method"])
+
+	def test_declared_endpoint_transport_error_is_not_retried_or_fallback(self):
+		client = SequenceClient([
+			health(10000), capabilities(), nvda_http.ClientError("incomplete response"),
+			health(200, pid=11, started=101.0),
+		])
+		args = nvda_http.build_parser().parse_args(["restart"])
+		clock = FakeClock()
+		sent = []
+		result, exit_code = nvda_http.run_restart(client, args, sender=sent.append, clock=clock, sleep=clock.sleep)
+		self.assertEqual(0, exit_code)
+		self.assertEqual([], sent)
+		self.assertTrue(result["data"]["postCompletionUnknown"])
 
 	def test_restart_rejects_unhealthy_baseline_before_sending_keys(self):
 		client = SequenceClient([health(10000, status="degraded")])
@@ -181,8 +226,8 @@ class BackupTests(unittest.TestCase):
 			self.calls = []
 			self.backup_path = None
 
-		def json(self, method, path, body=None, token_mode="none"):
-			self.calls.append((method, path, body, token_mode))
+		def json(self, method, path, body=None):
+			self.calls.append((method, path, body))
 			if method == "POST":
 				self.backup_path = str(Path(body["targetPath"]) / "nvda")
 				output = Path(self.backup_path)
@@ -224,10 +269,10 @@ class BackupTests(unittest.TestCase):
 			self.assertEqual(b"portable", (output / "nvda.exe").read_bytes())
 			self.assertEqual("config", (output / "userConfig" / "nvda.ini").read_text(encoding="utf-8"))
 			self.assertIn(
-				("POST", "/v1/backups", {"targetPath": str(target.resolve())}, "required"),
+				("POST", "/v1/backups", {"targetPath": str(target.resolve())}),
 				client.calls,
 			)
-			self.assertIn(("DELETE", "/v1/backups/backup-1", None, "required"), client.calls)
+			self.assertIn(("DELETE", "/v1/backups/backup-1", None), client.calls)
 
 	def test_backup_refuses_existing_destination(self):
 		with tempfile.TemporaryDirectory() as temporary:
@@ -251,8 +296,8 @@ class BackupTests(unittest.TestCase):
 			def __init__(self):
 				self.calls = []
 
-			def json(self, method, path, body=None, token_mode="none"):
-				self.calls.append((method, path, body, token_mode))
+			def json(self, method, path, body=None):
+				self.calls.append((method, path, body))
 				return {"httpStatus": 202, "data": {"jobId": "backup-1"}}
 
 		with tempfile.TemporaryDirectory() as temporary:
@@ -266,7 +311,7 @@ class BackupTests(unittest.TestCase):
 			nvda_http.execute(client, args)
 
 			self.assertEqual(
-				[("POST", "/v1/backups", {"targetPath": str(target.resolve())}, "required")],
+				[("POST", "/v1/backups", {"targetPath": str(target.resolve())})],
 				client.calls,
 			)
 

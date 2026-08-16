@@ -2,7 +2,7 @@
 
 import os
 
-from .errors import SecureContext, UnsafeAction
+from .errors import RestartBlocked, SecureContext, UnsafeAction
 from .serialization import ObjectAdapter
 
 
@@ -80,6 +80,27 @@ class NvdaAdapter(ObjectAdapter):
 			"version": str(buildVersion.version),
 			"detailed": str(getattr(buildVersion, "version_detailed", buildVersion.version)),
 		}
+
+	def nvda_identity(self):
+		import globalVars
+		import NVDAState
+
+		return {
+			"nvdaProcessId": int(globalVars.appPid),
+			"nvdaStartTime": float(NVDAState.getStartTime()),
+		}
+
+	def assert_restart_allowed(self):
+		self.assert_safe()
+		from gui.message import isModalMessageBoxActive
+
+		if isModalMessageBoxActive():
+			raise RestartBlocked("A modal NVDA message box is active")
+
+	def restart(self):
+		import core
+
+		core.restart()
 
 	def speak(self, text):
 		import ui

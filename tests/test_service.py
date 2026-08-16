@@ -5,7 +5,14 @@ from support import FakeAdapter, FakeNode, GLOBAL_PLUGINS
 
 from _nvdaHttpBridge.auth import SecurityState
 from _nvdaHttpBridge.config import SYNC_BATCH_NODES
-from _nvdaHttpBridge.errors import BadRequest, StaleObject, Unauthorized, UnsafeAction, ValidationError
+from _nvdaHttpBridge.errors import (
+	BadRequest,
+	RestartAlreadyScheduled,
+	RestartBlocked,
+	StaleObject,
+	UnsafeAction,
+	ValidationError,
+)
 from _nvdaHttpBridge.events import EventBuffer, SpeechObserver
 from _nvdaHttpBridge.serialization import ObjectRegistry
 from _nvdaHttpBridge.service import BridgeService
@@ -64,6 +71,16 @@ class ActionAdapter(FakeAdapter):
 	def default_action(self, obj):
 		self.calls.append(("default_action", obj))
 
+	def assert_restart_allowed(self):
+		self.calls.append(("assert_restart_allowed",))
+
+	def schedule(self, callback):
+		self.calls.append(("schedule", callback))
+		callback()
+
+	def restart(self):
+		self.calls.append(("restart",))
+
 
 class TreeAdapter(FakeAdapter):
 	def __init__(self, root):
@@ -76,19 +93,6 @@ class TreeAdapter(FakeAdapter):
 	def get_root(self, root_name):
 		self.requested_root = root_name
 		return self.root
-
-
-class FakeTokens:
-	path = "C:/fake/nvdaHttpBridge.token"
-
-	def __init__(self, expected="secret"):
-		self.expected = expected
-		self.supplied = []
-
-	def authorize(self, token):
-		self.supplied.append(token)
-		if token != self.expected:
-			raise Unauthorized()
 
 
 class FakeExports:
@@ -135,7 +139,6 @@ class BridgeServiceActionTests(unittest.TestCase):
 		self.registry = ObjectRegistry(adapter=self.adapter)
 		self.events = EventBuffer()
 		self.speech = SpeechObserver(self.events)
-		self.tokens = FakeTokens()
 		self.backups = FakeBackups()
 		self.service = BridgeService(
 			self.adapter,
@@ -144,7 +147,6 @@ class BridgeServiceActionTests(unittest.TestCase):
 			self.events,
 			self.speech,
 			FakeExports(),
-			self.tokens,
 			SecurityState(),
 			backups=self.backups,
 		)
@@ -152,16 +154,11 @@ class BridgeServiceActionTests(unittest.TestCase):
 	def tearDown(self):
 		self.events.close()
 
-	def test_write_and_sensitive_operations_require_valid_token(self):
-		# Ordinary read policy is configurable and currently loopback-only by default.
-		self.service.authorize(None)
-		for kwargs in ({"write": True}, {"sensitive": True}):
-			with self.subTest(kwargs=kwargs):
-				with self.assertRaises(Unauthorized):
-					self.service.authorize(None, **kwargs)
-				with self.assertRaises(Unauthorized):
-					self.service.authorize("wrong", **kwargs)
-				self.service.authorize("secret", **kwargs)
+	def test_capabilities_declare_no_authentication(self):
+		self.assertEqual(
+			{"mode": "none"},
+			self.service.capabilities()["auth"],
+		)
 
 	def test_speak_and_gesture_accept_only_whitelisted_fields(self):
 		for action, body in (
@@ -212,11 +209,37 @@ class BridgeServiceActionTests(unittest.TestCase):
 		)
 		self.assertIn(("gesture", "tab"), self.adapter.calls)
 
-	def test_restart_is_intentionally_unavailable_over_http(self):
+	def test_restart_is_intentionally_unavailable_through_generic_action(self):
 		with self.assertRaises(UnsafeAction) as caught:
 			self.service.action("restart", {})
 		self.assertEqual(409, caught.exception.status)
 		self.assertEqual("unsafeAction", caught.exception.code)
+
+	def test_dedicated_restart_prepares_once_and_schedules_native_restart(self):
+		prepared = self.service.prepare_restart({})
+		self.assertEqual("accepted", prepared["status"])
+		self.assertEqual(1234, prepared["before"]["nvdaProcessId"])
+		self.assertTrue(self.service.health()["restartPending"])
+		with self.assertRaises(RestartAlreadyScheduled):
+			self.service.prepare_restart({})
+		self.assertTrue(self.service.schedule_prepared_restart(prepared["restartId"]))
+		self.assertFalse(self.service.schedule_prepared_restart(prepared["restartId"]))
+		self.assertFalse(self.service.schedule_prepared_restart("wrong"))
+		self.assertEqual(1, self.adapter.calls.count(("restart",)))
+
+	def test_dedicated_restart_rejects_non_empty_or_non_object_bodies(self):
+		for body in ([], {"mode": "unsafe"}):
+			with self.subTest(body=body), self.assertRaises(ValidationError):
+				self.service.prepare_restart(body)
+		self.assertFalse(any(call[0] == "schedule" for call in self.adapter.calls))
+
+	def test_dedicated_restart_propagates_modal_precheck_without_reserving(self):
+		def blocked():
+			raise RestartBlocked()
+		self.adapter.assert_restart_allowed = blocked
+		with self.assertRaises(RestartBlocked):
+			self.service.prepare_restart({})
+		self.assertFalse(self.service.health()["restartPending"])
 
 	def test_backup_requires_only_target_path_and_is_advertised(self):
 		with self.assertRaises(ValidationError):
@@ -288,7 +311,6 @@ class BridgeServiceTreeBatchTests(unittest.TestCase):
 			events,
 			SpeechObserver(events),
 			FakeExports(),
-			FakeTokens(),
 			SecurityState(),
 		)
 		try:
@@ -330,7 +352,6 @@ class BridgeServiceTreeBatchTests(unittest.TestCase):
 			events,
 			SpeechObserver(events),
 			FakeExports(),
-			FakeTokens(),
 			SecurityState(),
 		)
 		try:

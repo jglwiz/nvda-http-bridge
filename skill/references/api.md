@@ -4,25 +4,22 @@
 
 Run `python <skill-directory>/scripts/nvda_http_bridge.py --help` for the complete argument list.
 
-| Command | Purpose | Token |
+| Command | Purpose | Authentication |
 |---|---|---|
-| `health`, `version`, `capabilities` | Diagnose and discover the live contract | No |
-| `object ROOT`, `object-id ID`, `tree` | Read current objects or a bounded tree | Optional; retried with token after 401 |
-| `speech-history`, `log-tail` | Read sensitive bounded history | Yes |
-| `events` | Collect a duration- and count-bounded SSE event stream | Yes |
-| `export-create/status/download/cancel` | Manage an asynchronous NDJSON tree export | Yes |
-| `export-run` | Create, poll, download, then delete an export job | Yes |
-| `speak`, `cancel-speech`, `gesture` | Perform a whitelisted action | Yes |
-| `focus-object`, `default-action` | Act on a current object ID/generation | Yes |
-| `restart` | Send external `NVDA+Shift+Q`, then verify a lower `uptimeMs` | No HTTP action |
-| `backup-create/status/cancel` | Manage an asynchronous complete backup; `--output PATH` is the target folder | Yes |
-| `backup` | Create and poll `<target>/nvda` (`./nvda` by default), then delete the HTTP job | Yes |
-| `settings-categories/get/set` | Read or patch the allowlisted General settings | Yes |
-| `speech-dictionaries`, `speech-dictionary-get/validate/put` | Manage NVDA speech dictionaries | Yes |
-| `symbols-get/put` | Manage locale symbol pronunciation overrides | Yes |
-| `gestures-get/patch` | Read current-context commands or change user gesture bindings | Yes |
+| `health`, `version`, `capabilities` | Diagnose and discover the live contract | None |
+| `object ROOT`, `object-id ID`, `tree` | Read current objects or a bounded tree | None |
+| `speech-history`, `log-tail` | Read sensitive bounded history | None |
+| `events` | Collect a duration- and count-bounded SSE event stream | None |
+| `export-create/status/download/cancel`, `export-run` | Manage an asynchronous NDJSON tree export | None |
+| `speak`, `cancel-speech`, `gesture`, `focus-object`, `default-action` | Perform whitelisted actions | None |
+| `restart` | Use the dedicated lifecycle endpoint and verify new process identity; external hotkey only for an old Bridge | None |
+| `backup-create/status/cancel`, `backup` | Create and manage a complete backup | None |
+| `settings-categories/get/set` | Read or patch the allowlisted General settings | None |
+| `speech-dictionaries`, `speech-dictionary-get/validate/put` | Manage NVDA speech dictionaries | None |
+| `symbols-get/put` | Manage locale symbol pronunciation overrides | None |
+| `gestures-get/patch` | Read current-context commands or change user gesture bindings | None |
 
-The client only connects to `http://127.0.0.1:<port>` and reads the token from `%APPDATA%\nvda\nvdaHttpBridge.token` unless `--token-file` is explicitly supplied.
+The client only connects to `http://127.0.0.1:<port>` and sends no credentials. Any local process can call the Bridge, so never proxy or expose its port.
 
 ## Live HTTP contract
 
@@ -39,24 +36,26 @@ The client only connects to `http://127.0.0.1:<port>` and reads the token from `
 - Speech dictionaries: `GET /v1/speech-dictionaries`, `GET`/`PUT /v1/speech-dictionaries/{id}`, `POST .../{id}/validate`
 - Symbol pronunciation: `GET`/`PUT /v1/symbol-dictionaries/{locale}`
 - Input gestures: `GET`/`PATCH /v1/gestures`
+- Lifecycle: `POST /v1/lifecycle/restart` with `{}`
 
-`restart` is a client-side Windows workflow, not an HTTP endpoint. It sends the configured global shortcut outside the NVDA process and polls `GET /health`. A refused connection, dropped connection, or incomplete response while NVDA exits counts as observed unavailability; polling continues. Success requires `status: ok` and an `uptimeMs` lower than the pre-restart value. Choose `--nvda-key insert` (default) or `--nvda-key capslock` to match the local NVDA modifier.
+`POST /v1/lifecycle/restart` is process-boundary asynchronous: it requires no credentials and accepts only an empty object, returns `202` completely, closes the request, and only then schedules native `core.restart()`. The CLI sends this POST exactly once and polls `GET /health`; connection refusal, reset, or an incomplete response is completion-unknown and never causes a retry or hotkey fallback. Success requires a changed `nvdaProcessId` or `nvdaStartTime`; lower `uptimeMs` alone can be caused by plugin reload. If live capabilities omit this endpoint, the CLI uses the configured external `NVDA+Shift+Q` compatibility fallback.
 
-`backup --output PATH` sends normalized `PATH` as the required `targetPath`. The plugin creates `<PATH>/nvda`, including missing target parents, calls NVDA's internal portable-copy implementation with current configuration, refuses an existing child, removes the token file, and returns the resulting directory as `backupPath`. Deleting or expiring the HTTP job preserves the completed backup.
+`backup --output PATH` sends normalized `PATH` as the required `targetPath`. The plugin creates `<PATH>/nvda`, including missing target parents, calls NVDA's internal portable-copy implementation with current configuration, refuses an existing child, excludes any legacy Bridge credential file, and returns the resulting directory as `backupPath`. Deleting or expiring the HTTP job preserves the completed backup.
 - Events: `GET /v1/events`; the client defaults to 5 seconds and at most 50 events. Use `--last-event-id` to resume after a previously returned ID.
 
-Query the live `capabilities` endpoint before assuming limits. Version 1.1.1 defaults are depth 3, 20 children per parent, 200 nodes, and 500 ms. Synchronous hard limits are depth 10, 200 children, 1000 nodes, 3000 ms, and 2 MiB. Exports retain emergency caps of depth 100, 10,000 children, 1,000,000 nodes, 100 MiB per job, 200 MiB total, and 300 seconds.
+Query the live `capabilities` endpoint before assuming limits. Version 1.3.0 defaults are depth 3, 20 children per parent, 200 nodes, and 500 ms. Synchronous hard limits are depth 10, 200 children, 1000 nodes, 3000 ms, and 2 MiB. Exports retain emergency caps of depth 100, 10,000 children, 1,000,000 nodes, 100 MiB per job, 200 MiB total, and 300 seconds.
 
 ## Error handling
 
 | Status/code | Meaning | Response |
 |---|---|---|
-| `401 unauthorized` | Token missing or invalid | Let the client load the token; never display it |
 | `403 forbidden` | Bad Host/origin | Keep the loopback base URL |
 | `403 secureContext` | Lock screen or secure desktop | Stop sensitive work |
 | `409 staleObject` | Object ID/generation expired | Re-read the current object |
 | `409 staleState` | A configuration revision or gesture UI context changed | GET the resource again and re-evaluate the intended change |
 | `409 unsafeAction` | Lifecycle or dangerous gesture denied | Do not work around it |
+| `409 restartBlocked` | NVDA modal state prevents a safe restart | Close the modal UI and make a new explicitly authorized request |
+| `409 restartAlreadyScheduled` | This Bridge process already accepted a restart | Do not resend; poll health for a new process identity |
 | `422 exportRequired` | Synchronous hard limit exceeded | Use an asynchronous export |
 | `429` | Concurrency or rate limit reached | Back off; do not fan out requests |
 | `504 mainThreadTimeout` | NVDA main thread missed the deadline | If `completionUnknown=true`, GET the resource to reconcile; never auto-retry the write |

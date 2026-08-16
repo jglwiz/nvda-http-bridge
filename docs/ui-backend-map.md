@@ -52,7 +52,7 @@ revision 包含焦点 UI context generation 和用户手势映射。焦点上下
 HTTP route → BridgeService → 专用 adapter → MainThreadExecutor → NVDA 后端
 ```
 
-- 四类资源都要求本地 token，并继承 Host/Origin、回环地址、安全桌面、请求体和并发限制。
+- 四类资源都不要求凭据，并继承 Host/Origin、回环地址、安全桌面、请求体和并发限制。任何本机进程都能调用 Bridge。
 - 排队超时保证任务未执行，`completionUnknown=false`；已经开始的主线程调用超时返回 `504 mainThreadTimeout` 和 `completionUnknown=true`。
 - 客户端遇到未知完成状态后只 GET 同一资源对账，不自动重发写请求。
 - 文件保存异常时恢复内存快照并尝试恢复磁盘；因为 NVDA 保存过程未统一承诺事务原子性，接口返回 `partialFailure` 和回滚信息。

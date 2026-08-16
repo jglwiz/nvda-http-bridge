@@ -6,7 +6,7 @@ import unittest
 from support import FakeClock, GLOBAL_PLUGINS  # noqa: F401
 
 from _nvdaHttpBridge.backups import BackupManager
-from _nvdaHttpBridge.config import BACKUP_TTL_SECONDS, TOKEN_FILE_NAME
+from _nvdaHttpBridge.config import BACKUP_TTL_SECONDS, LEGACY_CREDENTIAL_FILE_NAME
 from _nvdaHttpBridge.errors import Conflict, NotFound, SecureContext, TooManyRequests
 
 
@@ -30,7 +30,7 @@ class BackupAdapter:
 			output.write(b"portable")
 		with open(os.path.join(destination, "userConfig", "nvda.ini"), "w", encoding="utf-8") as output:
 			output.write("config")
-		with open(os.path.join(destination, "userConfig", TOKEN_FILE_NAME), "w", encoding="utf-8") as output:
+		with open(os.path.join(destination, "userConfig", LEGACY_CREDENTIAL_FILE_NAME), "w", encoding="utf-8") as output:
 			output.write("secret")
 
 
@@ -81,7 +81,7 @@ class BackupManagerTests(unittest.TestCase):
 		self.assertFalse(job.thread.is_alive(), "backup worker did not terminate")
 		return manager.status(job_id), job
 
-	def test_target_path_creates_nvda_child_and_excludes_http_token(self):
+	def test_target_path_creates_nvda_child_and_excludes_legacy_credential(self):
 		manager = self.manager()
 		target_path = os.path.join(self.temp.name, "nested", "backups")
 		created = manager.create(target_path)
@@ -95,7 +95,7 @@ class BackupManagerTests(unittest.TestCase):
 		self.assertGreater(status["bytes"], 0)
 		self.assertTrue(os.path.isfile(os.path.join(backup_path, "nvda.exe")))
 		self.assertTrue(os.path.isfile(os.path.join(backup_path, "userConfig", "nvda.ini")))
-		self.assertFalse(os.path.exists(os.path.join(backup_path, "userConfig", TOKEN_FILE_NAME)))
+		self.assertFalse(os.path.exists(os.path.join(backup_path, "userConfig", LEGACY_CREDENTIAL_FILE_NAME)))
 
 		manager.cancel(created["jobId"])
 		self.assertTrue(os.path.isdir(backup_path), "deleting the HTTP job must preserve the backup")
