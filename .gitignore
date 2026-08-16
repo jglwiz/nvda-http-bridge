@@ -1,0 +1,8 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+
+# Generated NVDA add-on packages
+dist/
+*.nvda-addon
+*.zip

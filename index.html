@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NVDA HTTP Bridge</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --text:#e6edf3; --muted:#8b949e; --line:#30363d; --accent:#58a6ff; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:16px/1.65 system-ui,"Segoe UI",sans-serif; }
+    main { max-width:980px; margin:auto; padding:48px 24px 72px; }
+    h1 { margin:0 0 8px; font-size:2.5rem; }
+    h2 { margin-top:40px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    p, li { max-width:82ch; }
+    .lead { color:var(--muted); font-size:1.1rem; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin:16px 0; }
+    code { font-family:"Cascadia Code",Consolas,monospace; color:#79c0ff; }
+    pre { overflow:auto; background:#010409; border:1px solid var(--line); border-radius:8px; padding:14px; }
+    pre code { color:var(--text); }
+    table { width:100%; border-collapse:collapse; }
+    th, td { text-align:left; padding:10px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { color:var(--muted); }
+    .method { display:inline-block; min-width:54px; color:#fff; font-weight:700; }
+    a { color:var(--accent); }
+    footer { margin-top:48px; color:var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>NVDA HTTP Bridge</h1>
+  <p class="lead">面向本地 CLI、自动化测试和 agent 的 NVDA 回环 HTTP 接口。项目、add-on ID、实现包和产物统一采用 NVDA HTTP Bridge / <code>nvdaHttpBridge</code> 命名。</p>
+
+  <div class="card">
+    <strong>严格协议</strong>
+    <p>服务只监听 <code>127.0.0.1:19281</code>。业务接口统一位于 <code>/v1</code>，树根名称与参数、动作名和备份字段均只接受文档中的规范形式。</p>
+  </div>
+
+  <h2>快速验证</h2>
+  <pre><code>curl.exe http://127.0.0.1:19281/health
+curl.exe http://127.0.0.1:19281/v1/version
+curl.exe http://127.0.0.1:19281/v1/capabilities
+curl.exe http://127.0.0.1:19281/v1/objects/focus</code></pre>
+  <p>写操作以及语音、日志、事件、导出和备份等敏感接口必须发送 <code>Authorization: Bearer &lt;token&gt;</code>。token 位于 <code>%APPDATA%\nvda\nvdaHttpBridge.token</code>，不得放进 URL。</p>
+
+  <h2>接口</h2>
+  <table>
+    <thead><tr><th>方法</th><th>路径</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method">GET</span></td><td><code>/health</code></td><td>健康、运行时间和任务指标</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/version</code></td><td>插件、协议、NVDA 与 Python 版本</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/capabilities</code></td><td>限制、字段、动作和事件类型</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/objects/{focus|foreground|navigator|desktop}</code></td><td>对象快照</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/objects/by-id/{objectId}</code></td><td>读取当前 generation 中的对象</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/tree</code></td><td>有界可访问性树</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/speech</code>、<code>/v1/log</code></td><td>敏感历史</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/events</code></td><td>SSE 事件流</td></tr>
+      <tr><td><span class="method">POST</span></td><td><code>/v1/tree/exports</code></td><td>创建异步 NDJSON 树导出</td></tr>
+      <tr><td><span class="method">POST</span></td><td><code>/v1/backups</code></td><td>创建异步便携版备份</td></tr>
+      <tr><td><span class="method">POST</span></td><td><code>/v1/actions/{action}</code></td><td>执行白名单动作</td></tr>
+    </tbody>
+  </table>
+
+  <h2>有界树与导出</h2>
+  <p>同步树默认深度 3、每个父节点 20 个子节点、总计 200 个节点和 500 ms。根对象只接受 <code>focus</code>、<code>foreground</code>、<code>navigator</code>、<code>desktop</code>。</p>
+  <pre><code>curl.exe "http://127.0.0.1:19281/v1/tree?root=foreground&amp;depth=6&amp;maxChildren=100&amp;maxNodes=800&amp;timeoutMs=2500&amp;format=flat"</code></pre>
+  <p>超过同步上限时使用 <code>POST /v1/tree/exports</code>。通过 <code>GET /v1/tree/exports/{jobId}</code> 查询状态，<code>GET /v1/tree/exports/{jobId}/data</code> 下载，<code>DELETE /v1/tree/exports/{jobId}</code> 取消或清理。</p>
+
+  <h2>备份</h2>
+  <p><code>POST /v1/backups</code> 的请求体必须且只能包含 <code>{"targetPath":"D:\\backups"}</code>。插件创建 <code>D:\backups\nvda</code>，拒绝覆盖现有目录，并从结果中移除 HTTP token。状态响应以 <code>backupPath</code> 返回实际目录。</p>
+  <pre><code>POST   /v1/backups
+GET    /v1/backups/{jobId}
+DELETE /v1/backups/{jobId}</code></pre>
+  <p>删除或过期任务只清理任务状态，不删除已完成的备份。</p>
+
+  <h2>动作</h2>
+  <p>动作名只接受 <code>speak</code>、<code>cancel-speech</code>、<code>gesture</code>、<code>focus</code> 和 <code>default-action</code>。HTTP 内不提供重启；重启测试必须由外部客户端发送明确配置的 NVDA 快捷键并核对新的运行时间。</p>
+  <pre><code>Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:19281/v1/actions/speak `
+  -Headers $headers -ContentType application/json `
+  -Body '{"text":"任务完成"}'</code></pre>
+
+  <h2>构建与验证</h2>
+  <pre><code>.\build.ps1
+python -m unittest discover -s tests -v
+python -m compileall nvda-addon/globalPlugins</code></pre>
+  <p>默认产物为 <code>dist/nvdaHttpBridge-1.0.0.nvda-addon</code>。</p>
+
+  <footer>NVDA HTTP Bridge · 1.0.0</footer>
+</main>
+</body>
+</html>
