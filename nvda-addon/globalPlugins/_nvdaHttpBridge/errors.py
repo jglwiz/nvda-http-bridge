@@ -54,6 +54,17 @@ class Conflict(BridgeError):
 	default_message = "The request conflicts with the current bridge state"
 
 
+class StaleState(Conflict):
+	code = "staleState"
+	default_message = "The resource changed since it was read"
+
+
+class PartialFailure(BridgeError):
+	status = 500
+	code = "partialFailure"
+	default_message = "The operation failed and persistence could not be proven atomic"
+
+
 class ValidationError(BridgeError):
 	status = 422
 	code = "validationError"

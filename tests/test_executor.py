@@ -1,4 +1,5 @@
 import unittest
+import threading
 
 from support import GLOBAL_PLUGINS  # noqa: F401
 
@@ -12,7 +13,7 @@ class MainThreadExecutorTests(unittest.TestCase):
 		executed = []
 		executor = MainThreadExecutor(scheduled.append)
 
-		with self.assertRaises(MainThreadTimeout):
+		with self.assertRaises(MainThreadTimeout) as caught:
 			executor.call(lambda: executed.append(True), timeout_ms=10)
 
 		self.assertEqual(1, len(scheduled))
@@ -20,6 +21,27 @@ class MainThreadExecutorTests(unittest.TestCase):
 		self.assertEqual([], executed)
 		self.assertEqual(0, executor.metrics()["pending"])
 		self.assertEqual(0, executor.metrics()["running"])
+		self.assertFalse(caught.exception.details["completionUnknown"])
+
+	def test_running_timeout_reports_unknown_completion(self):
+		started = threading.Event()
+		release = threading.Event()
+
+		def scheduler(callback):
+			threading.Thread(target=callback, daemon=True).start()
+
+		def work():
+			started.set()
+			release.wait(1)
+
+		executor = MainThreadExecutor(scheduler)
+		try:
+			with self.assertRaises(MainThreadTimeout) as caught:
+				executor.call(work, timeout_ms=20)
+			self.assertTrue(started.is_set())
+			self.assertTrue(caught.exception.details["completionUnknown"])
+		finally:
+			release.set()
 
 	def test_scheduler_failure_is_reported_as_service_unavailable(self):
 		def fail_to_schedule(_callback):

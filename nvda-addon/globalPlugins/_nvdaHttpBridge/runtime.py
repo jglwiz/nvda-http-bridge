@@ -7,7 +7,11 @@ from .backups import BackupManager
 from .events import EventBuffer, SpeechObserver
 from .executor import MainThreadExecutor
 from .exports import ExportManager
+from .gestures import GesturesAdapter
 from .nvda_adapter import NvdaAdapter
+from .settings import SettingsAdapter
+from .speech_dictionaries import SpeechDictionariesAdapter
+from .symbol_dictionaries import SymbolDictionariesAdapter
 from .serialization import ObjectRegistry
 from .server import BoundedHTTPServer
 from .service import BridgeService
@@ -30,6 +34,10 @@ class BridgeRuntime:
 		self.speech.set_enabled(capture_enabled)
 		self.registry = ObjectRegistry(adapter=self.adapter)
 		self.executor = MainThreadExecutor(self.adapter.schedule)
+		self.settings = SettingsAdapter()
+		self.speech_dictionaries = SpeechDictionariesAdapter()
+		self.symbol_dictionaries = SymbolDictionariesAdapter()
+		self.gestures = GesturesAdapter()
 		self.exports = ExportManager(
 			self.executor,
 			self.adapter.get_root,
@@ -54,6 +62,10 @@ class BridgeRuntime:
 			self.tokens,
 			self.security,
 			backups=self.backups,
+			settings=self.settings,
+			speech_dictionaries=self.speech_dictionaries,
+			symbol_dictionaries=self.symbol_dictionaries,
+			gestures=self.gestures,
 		)
 		self.server = None
 		self._registered = []

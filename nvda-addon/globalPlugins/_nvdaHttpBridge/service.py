@@ -78,6 +78,10 @@ class BridgeService:
 		tokens,
 		security_state,
 		backups=None,
+		settings=None,
+		speech_dictionaries=None,
+		symbol_dictionaries=None,
+		gestures=None,
 		monotonic=None,
 	):
 		self.adapter = adapter
@@ -89,6 +93,10 @@ class BridgeService:
 		self.tokens = tokens
 		self.security_state = security_state
 		self.backups = backups
+		self.settings = settings
+		self.speech_dictionaries = speech_dictionaries
+		self.symbol_dictionaries = symbol_dictionaries
+		self.gestures = gestures
 		self._monotonic = monotonic or time.monotonic
 		self._started_at = self._monotonic()
 		self._closing = False
@@ -217,10 +225,82 @@ class BridgeService:
 				"treeExports": "/v1/tree/exports",
 				"backups": "/v1/backups",
 				"events": "/v1/events",
+				"settings": "/v1/settings/general",
+				"speechDictionaries": "/v1/speech-dictionaries",
+				"symbolDictionaries": "/v1/symbol-dictionaries/{locale}",
+				"gestures": "/v1/gestures",
+			},
+			"configurationResources": {
+				"settings/general": {
+					"execution": "synchronous",
+					"fields": [
+						"language", "saveConfigurationOnExit", "askToExit",
+						"playStartAndExitSounds", "preventDisplayTurningOff",
+					],
+					"persistedByEndpoint": False,
+					"restartFields": ["language"],
+				},
+				"speechDictionaries": {
+					"execution": "synchronous",
+					"ids": ["default", "voice", "temp"],
+					"clearAllSupported": False,
+				},
+				"symbolDictionaries": {
+					"execution": "synchronous",
+					"actions": ["add", "edit", "removeUserOverride"],
+				},
+				"gestures": {
+					"execution": "synchronous",
+					"actions": ["add", "remove", "unbind", "addKbEmulation"],
+					"resetAllSupported": False,
+				},
 			},
 			"actions": ["speak", "cancel-speech", "gesture", "focus", "default-action"],
 			"eventTypes": ["gainFocus", "foreground", "nameChange", "valueChange", "stateChange", "caret", "speech"],
 		}
+
+	def _configuration_call(self, adapter, method_name, *args, timeout_ms=3000):
+		self.assert_data_available()
+		if adapter is None:
+			from .errors import ServiceUnavailable
+
+			raise ServiceUnavailable("The requested configuration resource is unavailable")
+		return self.executor.call(lambda: getattr(adapter, method_name)(*args), timeout_ms)
+
+	def settings_categories(self):
+		return self._configuration_call(self.settings, "categories")
+
+	def general_settings(self):
+		return self._configuration_call(self.settings, "get_general")
+
+	def patch_general_settings(self, body):
+		return self._configuration_call(self.settings, "patch_general", body)
+
+	def speech_dictionary_list(self):
+		return self._configuration_call(self.speech_dictionaries, "list")
+
+	def speech_dictionary(self, dictionary_id):
+		return self._configuration_call(self.speech_dictionaries, "get", dictionary_id)
+
+	def validate_speech_dictionary(self, dictionary_id, body):
+		return self._configuration_call(self.speech_dictionaries, "validate", dictionary_id, body)
+
+	def put_speech_dictionary(self, dictionary_id, body):
+		return self._configuration_call(self.speech_dictionaries, "put", dictionary_id, body)
+
+	def symbol_dictionary(self, locale):
+		return self._configuration_call(self.symbol_dictionaries, "get", locale)
+
+	def put_symbol_dictionary(self, locale, body):
+		return self._configuration_call(self.symbol_dictionaries, "put", locale, body)
+
+	def gesture_mappings(self, context="current", filter_text=None):
+		if context != "current":
+			raise ValidationError("Only context=current is supported")
+		return self._configuration_call(self.gestures, "get", filter_text)
+
+	def patch_gestures(self, body):
+		return self._configuration_call(self.gestures, "patch", body)
 
 	def object_snapshot(self, root_name, params=None):
 		self.assert_data_available()

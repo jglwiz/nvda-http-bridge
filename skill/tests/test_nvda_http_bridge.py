@@ -72,6 +72,41 @@ class ClientTransportTests(unittest.TestCase):
 		self.assertTrue(response.closed)
 
 
+class ConfigurationCommandTests(unittest.TestCase):
+	class Client:
+		def __init__(self, first=None):
+			self.calls = []
+			self.first = first
+
+		def json(self, method, path, body=None, token_mode="none"):
+			self.calls.append((method, path, body, token_mode))
+			if len(self.calls) == 1 and self.first is not None:
+				return self.first
+			return {"httpStatus": 200, "data": {"revision": "actual"}}
+
+	def test_settings_set_reads_structured_body_and_reconciles_running_timeout(self):
+		unknown = {
+			"httpStatus": 504,
+			"data": {"error": {"code": "mainThreadTimeout", "details": {"completionUnknown": True}}},
+		}
+		with tempfile.TemporaryDirectory() as temporary:
+			body_file = Path(temporary) / "settings.json"
+			body_file.write_text('{"baseRevision":"old","values":{"askToExit":false}}', encoding="utf-8")
+			args = nvda_http.build_parser().parse_args(["settings-set", "--body-file", str(body_file)])
+			client = self.Client(unknown)
+			result, unused_exit = nvda_http.execute(client, args)
+		self.assertEqual("actual", result["reconciliation"]["data"]["revision"])
+		self.assertEqual("PATCH", client.calls[0][0])
+		self.assertEqual("GET", client.calls[1][0])
+
+	def test_gesture_and_dictionary_commands_use_resource_specific_routes(self):
+		client = self.Client()
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["gestures-get", "--filter", "time"]))
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["speech-dictionary-get", "voice"]))
+		self.assertEqual("/v1/gestures?context=current&filter=time", client.calls[0][1])
+		self.assertEqual("/v1/speech-dictionaries/voice", client.calls[1][1])
+
+
 class RestartTests(unittest.TestCase):
 	def test_restart_sends_external_hotkey_and_requires_lower_uptime(self):
 		client = SequenceClient([

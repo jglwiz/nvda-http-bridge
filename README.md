@@ -1,5 +1,7 @@
 # NVDA HTTP Bridge
 
+配置 API 的 NVDA 前端/后端对应关系见 [docs/ui-backend-map.md](docs/ui-backend-map.md)。这些接口调用 NVDA 自身配置对象与保存流程，不执行 GUI 模拟。
+
 NVDA HTTP Bridge 是一个仅监听本机回环地址的 NVDA 全局插件。它为 CLI、自动化测试和 agent 提供版本化的焦点、对象、语音、事件、树查询和受控动作 API。
 
 ## 命名
@@ -48,7 +50,7 @@ _nvdaHttpBridge/
 .\build.ps1
 ```
 
-产物写入 `dist/nvdaHttpBridge-1.0.0.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
+产物写入 `dist/nvdaHttpBridge-1.1.0.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
 
 启动后，写操作 token 位于：
 
@@ -97,6 +99,41 @@ curl.exe "http://127.0.0.1:19281/v1/tree?root=foreground&depth=6&maxChildren=100
 - `tree`
 
 可能的截断原因包括 `depthLimit`、`childLimit`、`nodeLimit`、`timeLimit`、`sizeLimit` 和 `cycleDetected`。
+
+## 同步配置接口
+
+配置资源始终要求 token，并在 NVDA 主线程中通过专用 adapter 调用其后端：
+
+```text
+GET   /v1/settings/categories
+GET   /v1/settings/general
+PATCH /v1/settings/general
+
+GET  /v1/speech-dictionaries
+GET  /v1/speech-dictionaries/{default|voice|temp}
+POST /v1/speech-dictionaries/{id}/validate
+PUT  /v1/speech-dictionaries/{id}
+
+GET /v1/symbol-dictionaries/{locale|current}
+PUT /v1/symbol-dictionaries/{locale}
+
+GET   /v1/gestures?context=current&filter=...
+PATCH /v1/gestures
+```
+
+写请求必须带最新 GET 返回的 `baseRevision`。General 另带 `values`；朗读词典 PUT 带完整 `entries`；符号 PUT 带 `updates`/`remove`；手势 PATCH 带 `operations`。General 不自动保存全部配置；语言变化只报告需要重启。非空朗读词典整体清空和手势全部重置暂不支持，因为对应 UI 操作要求确认。
+
+CLI 使用 JSON 文件承载结构化写请求，例如：
+
+```powershell
+python skill/scripts/nvda_http_bridge.py settings-get
+python skill/scripts/nvda_http_bridge.py settings-set --body-file settings-change.json
+python skill/scripts/nvda_http_bridge.py speech-dictionary-get default
+python skill/scripts/nvda_http_bridge.py symbols-get current
+python skill/scripts/nvda_http_bridge.py gestures-get --filter time
+```
+
+如果写请求在 NVDA 主线程已经开始后发生超时，响应包含 `completionUnknown=true`；CLI 会自动 GET 对应资源并把实际状态放入 `reconciliation`，不会自动重发写请求。
 
 ## 异步完整树导出
 

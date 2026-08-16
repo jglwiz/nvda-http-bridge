@@ -76,6 +76,7 @@ class MainThreadExecutor:
 		if not task.done.wait(remaining):
 			timeout = MainThreadTimeout(details={"taskId": task.id})
 			canceled_pending = task.cancel_pending(timeout, self._monotonic())
+			timeout.details["completionUnknown"] = not canceled_pending
 			with self._lock:
 				self._last_timeout_at = self._monotonic()
 				if canceled_pending:
@@ -96,7 +97,11 @@ class MainThreadExecutor:
 				now = self._monotonic()
 				if self._closing or now >= task.deadline:
 					task.state = "canceled"
-					task.error = MainThreadTimeout(details={"taskId": task.id, "expiredBeforeStart": True})
+					task.error = MainThreadTimeout(details={
+						"taskId": task.id,
+						"expiredBeforeStart": True,
+						"completionUnknown": False,
+					})
 					task.finished_at = now
 					task.done.set()
 					return

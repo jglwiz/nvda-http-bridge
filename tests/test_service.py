@@ -232,6 +232,28 @@ class BridgeServiceActionTests(unittest.TestCase):
 		self.assertIn(("create", "D:/target"), self.backups.calls)
 		self.assertEqual("nvda", self.service.capabilities()["backupLimits"]["targetPathChildName"])
 
+	def test_configuration_resources_are_thin_main_thread_orchestration(self):
+		class Resource:
+			def __init__(self):
+				self.calls = []
+
+			def get_general(self):
+				self.calls.append("get_general")
+				return {"revision": "general"}
+
+			def patch_general(self, body):
+				self.calls.append(("patch_general", body))
+				return {"revision": "changed"}
+
+		resource = Resource()
+		self.service.settings = resource
+		self.assertEqual({"revision": "general"}, self.service.general_settings())
+		self.assertEqual({"revision": "changed"}, self.service.patch_general_settings({"values": {}}))
+		self.assertEqual(["get_general", ("patch_general", {"values": {}})], resource.calls)
+		config_caps = self.service.capabilities()["configurationResources"]
+		self.assertFalse(config_caps["speechDictionaries"]["clearAllSupported"])
+		self.assertFalse(config_caps["gestures"]["resetAllSupported"])
+
 	def test_focus_allows_generation_to_be_omitted_but_rejects_wrong_generation(self):
 		node = FakeNode("button")
 		object_id = self.registry.register(node, "g1")

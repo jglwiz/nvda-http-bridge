@@ -29,6 +29,8 @@ _EXPORT_ROUTE = re.compile(r"^/v1/tree/exports/([A-Za-z0-9_-]+)(/data)?$")
 _BACKUP_ROUTE = re.compile(r"^/v1/backups/([A-Za-z0-9_-]+)$")
 _ACTION_ROUTE = re.compile(r"^/v1/actions/([a-z-]+)$")
 _OBJECT_ID_ROUTE = re.compile(r"^/v1/objects/by-id/([A-Za-z0-9_.-]+)$")
+_SPEECH_DICTIONARY_ROUTE = re.compile(r"^/v1/speech-dictionaries/(default|voice|temp)(/validate)?$")
+_SYMBOL_DICTIONARY_ROUTE = re.compile(r"^/v1/symbol-dictionaries/([A-Za-z0-9_-]+)$")
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
@@ -155,6 +157,12 @@ class RequestHandler(BaseHTTPRequestHandler):
 	def do_DELETE(self):
 		self._dispatch(self._delete)
 
+	def do_PATCH(self):
+		self._dispatch(self._patch)
+
+	def do_PUT(self):
+		self._dispatch(self._put)
+
 	def do_OPTIONS(self):
 		self._dispatch(
 			lambda: self._json_response(
@@ -217,7 +225,31 @@ class RequestHandler(BaseHTTPRequestHandler):
 		if not self.server.request_slots.acquire(blocking=False):
 			raise TooManyRequests("The active request limit was reached")
 		try:
-			if _OBJECT_ID_ROUTE.match(path):
+			if path == "/v1/settings/categories":
+				self._auth(sensitive=True)
+				self._json_response(200, service.settings_categories())
+			elif path == "/v1/settings/general":
+				self._auth(sensitive=True)
+				self._json_response(200, service.general_settings())
+			elif path == "/v1/speech-dictionaries":
+				self._auth(sensitive=True)
+				self._json_response(200, service.speech_dictionary_list())
+			elif (match := _SPEECH_DICTIONARY_ROUTE.match(path)) and not match.group(2):
+				self._auth(sensitive=True)
+				self._json_response(200, service.speech_dictionary(match.group(1)))
+			elif (match := _SYMBOL_DICTIONARY_ROUTE.match(path)):
+				self._auth(sensitive=True)
+				self._json_response(200, service.symbol_dictionary(match.group(1)))
+			elif path == "/v1/gestures":
+				self._auth(sensitive=True)
+				unknown = sorted(set(params) - {"context", "filter"})
+				if unknown:
+					raise BadRequest("Unknown gesture query parameters")
+				self._json_response(200, service.gesture_mappings(
+					self._one(params, "context", "current"),
+					self._one(params, "filter"),
+				))
+			elif _OBJECT_ID_ROUTE.match(path):
 				self._auth()
 				object_id = _OBJECT_ID_ROUTE.match(path).group(1)
 				self._json_response(200, service.object_by_id(object_id, params))
@@ -266,6 +298,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 		if not self.server.request_slots.acquire(blocking=False):
 			raise TooManyRequests("The active request limit was reached")
 		try:
+			match = _SPEECH_DICTIONARY_ROUTE.match(path)
+			if match and match.group(2) == "/validate":
+				self._auth(write=True)
+				self._json_response(200, service.validate_speech_dictionary(match.group(1), self._read_json()))
+				return
 			if path == "/v1/tree/exports":
 				self._auth(write=True, sensitive=True)
 				self._json_response(202, service.create_export(self._read_json()))
@@ -278,6 +315,40 @@ class RequestHandler(BaseHTTPRequestHandler):
 			if match:
 				self._auth(write=True)
 				self._json_response(200, service.action(match.group(1), self._read_json()))
+				return
+			raise NotFoundError()
+		finally:
+			self.server.request_slots.release()
+
+	def _patch(self):
+		path = urlparse(self.path).path.rstrip("/")
+		if not self.server.request_slots.acquire(blocking=False):
+			raise TooManyRequests("The active request limit was reached")
+		try:
+			self._auth(write=True)
+			if path == "/v1/settings/general":
+				self._json_response(200, self.server.service.patch_general_settings(self._read_json()))
+				return
+			if path == "/v1/gestures":
+				self._json_response(200, self.server.service.patch_gestures(self._read_json()))
+				return
+			raise NotFoundError()
+		finally:
+			self.server.request_slots.release()
+
+	def _put(self):
+		path = urlparse(self.path).path.rstrip("/")
+		if not self.server.request_slots.acquire(blocking=False):
+			raise TooManyRequests("The active request limit was reached")
+		try:
+			self._auth(write=True)
+			match = _SPEECH_DICTIONARY_ROUTE.match(path)
+			if match and not match.group(2):
+				self._json_response(200, self.server.service.put_speech_dictionary(match.group(1), self._read_json()))
+				return
+			match = _SYMBOL_DICTIONARY_ROUTE.match(path)
+			if match:
+				self._json_response(200, self.server.service.put_symbol_dictionary(match.group(1), self._read_json()))
 				return
 			raise NotFoundError()
 		finally:

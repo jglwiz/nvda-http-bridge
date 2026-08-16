@@ -355,6 +355,27 @@ def is_success(result):
 	return 200 <= result["httpStatus"] < 300
 
 
+def read_json_file(path):
+	try:
+		raw = path.read_bytes()
+	except OSError as error:
+		raise ClientError("unable to read JSON file: %s" % path) from error
+	if len(raw) > 256 * 1024:
+		raise ClientError("JSON file exceeds the 256 KiB request limit")
+	try:
+		return json.loads(raw.decode("utf-8-sig"))
+	except (UnicodeDecodeError, json.JSONDecodeError) as error:
+		raise ClientError("JSON file must contain valid UTF-8 JSON: %s" % path) from error
+
+
+def reconcile_unknown_completion(client, result, get_path):
+	error = (result.get("data") or {}).get("error") or {}
+	details = error.get("details") or {}
+	if result.get("httpStatus") == 504 and details.get("completionUnknown") is True:
+		result["reconciliation"] = client.json("GET", get_path, token_mode="required")
+	return result
+
+
 def job_id_from(result):
 	data = result.get("data") or {}
 	job_id = data.get("jobId")
@@ -696,6 +717,25 @@ def build_parser():
 		action = sub.add_parser(command)
 		action.add_argument("object_id")
 		action.add_argument("--generation")
+
+	for command in ("settings-categories", "settings-get", "speech-dictionaries"):
+		sub.add_parser(command)
+	settings_set = sub.add_parser("settings-set")
+	settings_set.add_argument("--body-file", type=Path, required=True)
+	for command in ("speech-dictionary-get", "speech-dictionary-validate", "speech-dictionary-put"):
+		dictionary = sub.add_parser(command)
+		dictionary.add_argument("dictionary_id", choices=("default", "voice", "temp"))
+		if command != "speech-dictionary-get":
+			dictionary.add_argument("--body-file", type=Path, required=True)
+	symbols_get = sub.add_parser("symbols-get")
+	symbols_get.add_argument("locale", default="current", nargs="?")
+	symbols_put = sub.add_parser("symbols-put")
+	symbols_put.add_argument("locale")
+	symbols_put.add_argument("--body-file", type=Path, required=True)
+	gestures_get = sub.add_parser("gestures-get")
+	gestures_get.add_argument("--filter")
+	gestures_patch = sub.add_parser("gestures-patch")
+	gestures_patch.add_argument("--body-file", type=Path, required=True)
 	return parser
 
 
@@ -753,6 +793,40 @@ def execute(client, args):
 			body["generation"] = args.generation
 		action = "focus" if command == "focus-object" else "default-action"
 		return client.json("POST", "/v1/actions/" + action, body, "required"), None
+	if command == "settings-categories":
+		return client.json("GET", "/v1/settings/categories", token_mode="required"), None
+	if command == "settings-get":
+		return client.json("GET", "/v1/settings/general", token_mode="required"), None
+	if command == "settings-set":
+		result = client.json("PATCH", "/v1/settings/general", read_json_file(args.body_file), "required")
+		return reconcile_unknown_completion(client, result, "/v1/settings/general"), None
+	if command == "speech-dictionaries":
+		return client.json("GET", "/v1/speech-dictionaries", token_mode="required"), None
+	if command == "speech-dictionary-get":
+		path = "/v1/speech-dictionaries/" + quote(args.dictionary_id, safe="")
+		return client.json("GET", path, token_mode="required"), None
+	if command in ("speech-dictionary-validate", "speech-dictionary-put"):
+		path = "/v1/speech-dictionaries/" + quote(args.dictionary_id, safe="")
+		method = "POST" if command.endswith("validate") else "PUT"
+		if method == "POST":
+			path += "/validate"
+		result = client.json(method, path, read_json_file(args.body_file), "required")
+		if method == "PUT":
+			result = reconcile_unknown_completion(client, result, path)
+		return result, None
+	if command == "symbols-get":
+		path = "/v1/symbol-dictionaries/" + quote(args.locale, safe="")
+		return client.json("GET", path, token_mode="required"), None
+	if command == "symbols-put":
+		path = "/v1/symbol-dictionaries/" + quote(args.locale, safe="")
+		result = client.json("PUT", path, read_json_file(args.body_file), "required")
+		return reconcile_unknown_completion(client, result, path), None
+	if command == "gestures-get":
+		path = query_path("/v1/gestures", {"context": "current", "filter": args.filter})
+		return client.json("GET", path, token_mode="required"), None
+	if command == "gestures-patch":
+		result = client.json("PATCH", "/v1/gestures", read_json_file(args.body_file), "required")
+		return reconcile_unknown_completion(client, result, "/v1/gestures?context=current"), None
 	raise ClientError("unsupported command")
 
 

@@ -18,6 +18,7 @@ class FakeService:
 		self.download_bytes = b'{"object":{"name":"root"}}\n'
 		self.download_handle = None
 		self.backup_calls = []
+		self.configuration_calls = []
 
 	def health(self):
 		self.health_calls += 1
@@ -47,6 +48,22 @@ class FakeService:
 	def cancel_backup(self, job_id):
 		self.backup_calls.append(("cancel", job_id))
 		return {"jobId": job_id, "status": "canceled"}
+
+	def general_settings(self):
+		self.configuration_calls.append(("general-get",))
+		return {"revision": "g1"}
+
+	def patch_general_settings(self, body):
+		self.configuration_calls.append(("general-patch", body))
+		return {"revision": "g2"}
+
+	def put_speech_dictionary(self, dictionary_id, body):
+		self.configuration_calls.append(("speech-put", dictionary_id, body))
+		return {"revision": "d2"}
+
+	def validate_speech_dictionary(self, dictionary_id, body):
+		self.configuration_calls.append(("speech-validate", dictionary_id, body))
+		return {"valid": True}
 
 
 class BoundedHTTPServerTests(unittest.TestCase):
@@ -225,6 +242,30 @@ class BoundedHTTPServerTests(unittest.TestCase):
 					connection.close()
 				self.assertEqual(404, response.status)
 				self.assertEqual("notFound", payload["error"]["code"])
+
+	def test_configuration_routes_use_explicit_methods_and_require_token(self):
+		connection = self.connection()
+		headers = {"Content-Type": "application/json", "Authorization": "Bearer token"}
+		try:
+			connection.request("GET", "/v1/settings/general", headers=headers)
+			get_response = connection.getresponse()
+			get_response.read()
+			connection.request("PATCH", "/v1/settings/general", body='{"baseRevision":"g1","values":{"askToExit":false}}', headers=headers)
+			patch_response = connection.getresponse()
+			patch_response.read()
+			connection.request("POST", "/v1/speech-dictionaries/default/validate", body='{"entries":[]}', headers=headers)
+			validate_response = connection.getresponse()
+			validate_response.read()
+			connection.request("PUT", "/v1/speech-dictionaries/default", body='{"baseRevision":"d1","entries":[]}', headers=headers)
+			put_response = connection.getresponse()
+			put_response.read()
+		finally:
+			connection.close()
+		self.assertEqual([200, 200, 200, 200], [get_response.status, patch_response.status, validate_response.status, put_response.status])
+		self.assertIn(("general-get",), self.service.configuration_calls)
+		self.assertIn(("speech-put", "default", {"baseRevision": "d1", "entries": []}), self.service.configuration_calls)
+		self.assertIn(("token", False, True), self.service.authorize_calls)
+		self.assertIn(("token", True, False), self.service.authorize_calls)
 
 
 if __name__ == "__main__":
