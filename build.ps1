@@ -1,5 +1,5 @@
 param(
-	[string]$PackagePath = (Join-Path $PSScriptRoot "dist\nvdaHttpBridge-1.4.0.nvda-addon")
+	[string]$PackagePath = (Join-Path $PSScriptRoot "release\nvdaHttpBridge-0.1.0.nvda-addon")
 )
 
 $ErrorActionPreference = "Stop"

@@ -52,7 +52,7 @@ nvda-addon/  NVDA global plugin sources and manifest
 skill/       Codex skill and safe CLI client
 tests/       HTTP Bridge unit tests
 docs/        Design and UI/backend mapping notes
-dist/        Local build artifacts (not tracked by Git)
+release/     Local release artifacts (not tracked by Git)
 build.ps1    NVDA add-on packaging script
 ```
 
@@ -78,7 +78,7 @@ For a packaged installation, build the add-on:
 The default artifact is written to:
 
 ```text
-dist/nvdaHttpBridge-1.4.0.nvda-addon
+release/nvdaHttpBridge-0.1.0.nvda-addon
 ```
 
 The build excludes `__pycache__` directories and `.pyc` files.
@@ -223,7 +223,7 @@ python skill/scripts/nvda_http_bridge.py tree --root foreground `
 
 The response reports its generation, applied limits, node count, elapsed time, truncation state, and truncation reasons. Reasons can include `depthLimit`, `childLimit`, `nodeLimit`, `timeLimit`, `sizeLimit`, and `cycleDetected`.
 
-Version 1.4.0 defaults to depth 3, 20 children per parent, 200 nodes, and a 500 ms soft time budget. Synchronous hard limits are depth 10, 200 children per parent, 1,000 nodes, 3 seconds, and 2 MiB of JSON. Query live capabilities instead of hard-coding these values.
+Version 0.1.0 defaults to depth 3, 20 children per parent, 200 nodes, and a 500 ms soft time budget. Synchronous hard limits are depth 10, 200 children per parent, 1,000 nodes, 3 seconds, and 2 MiB of JSON. Query live capabilities instead of hard-coding these values.
 
 If the requested scope exceeds synchronous limits, the server returns `422 exportRequired`. Use the asynchronous tree export workflow instead of splitting a large traversal into repeated synchronous calls:
 

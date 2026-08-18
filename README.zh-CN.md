@@ -28,7 +28,7 @@ NVDA HTTP Bridge 是一个仅监听本机回环地址的 NVDA 全局插件。它
 nvda-addon/  NVDA 全局插件源码与 manifest
 skill/       Codex skill 与安全 CLI 客户端
 tests/       HTTP Bridge 单元测试
-dist/        本地构建产物（不纳入 Git）
+release/     本地发布产物（不纳入 Git）
 build.ps1    NVDA add-on 打包脚本
 ```
 
@@ -64,7 +64,7 @@ _nvdaHttpBridge/
 .\build.ps1
 ```
 
-产物写入 `dist/nvdaHttpBridge-1.4.0.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
+产物写入 `release/nvdaHttpBridge-0.1.0.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
 
 所有接口都不要求凭据。访问边界仅由 `127.0.0.1` 监听、Host/浏览器来源检查、安全桌面限制、严格 schema 与资源限制构成。旧版本遗留的 `%APPDATA%\nvda\nvdaHttpBridge.token` 不再读取或创建。
 

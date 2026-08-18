@@ -4,6 +4,7 @@ __pycache__/
 
 # Generated NVDA add-on packages
 dist/
+release/
 *.nvda-addon
 *.zip
 
