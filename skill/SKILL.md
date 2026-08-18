@@ -1,6 +1,6 @@
 ---
 name: nvda
-description: Inspect and control a locally running NVDA screen reader through NVDA HTTP Bridge, restart NVDA through its dedicated lifecycle API with a legacy external-hotkey fallback, and create a complete portable backup with current configuration. Use when the user asks about current NVDA focus, foreground or navigator objects, accessibility trees, NVDA events, speech or log history, bounded or full tree exports, speaking or canceling speech, focusing an object, safe gestures or default actions, restarting or backing up NVDA, HTTP bridge health, or an NVDA 504 mainThreadTimeout whose stack is stopped in WTSCurrentSessionInfoEx. Do not use for generic NVDA source-code work that does not require a running local NVDA instance.
+description: Inspect and control a locally running NVDA screen reader through NVDA HTTP Bridge, including runtime modes, bounded caret/selection/object text, add-on/plugin/driver diagnostics, dedicated restart, and complete portable backup. Use when the user asks about NVDA focus or objects, accessibility trees, current text or selection, runtime status or modes, add-ons and drivers, diagnostic bundles, events, speech or logs, controlled actions, restarting or backing up NVDA, bridge health, or an NVDA 504 mainThreadTimeout stopped in WTSCurrentSessionInfoEx. Do not use for generic NVDA source-code work that does not require a running local NVDA instance.
 ---
 
 # NVDA
@@ -16,7 +16,11 @@ python <skill-directory>/scripts/nvda_http_bridge.py health
 1. Run `health`. If the bridge is absent, report that NVDA HTTP Bridge is not running; do not start or install software unless the user asked.
 2. Run `capabilities` before relying on limits or optional behavior. Treat the live response as authoritative.
 3. Choose the smallest operation that answers the request:
-   - Current object: `object focus`, `object foreground`, or `object navigator`.
+	- Current object: `object focus`, `object foreground`, or `object navigator`.
+	- Runtime and modes: `status` or `modes-get`; mutate with `modes-patch` only after explicit intent.
+	- Text: `text-caret`, `text-selection`, or bounded `text-object`; use `set-caret`/`set-selection` only with fresh object generation and revision.
+	- Inventory: `addons`, `global-plugins`, `drivers`, or `diagnostics`.
+	- Diagnostic bundle: `diagnostic-export-run --output <approved-zip-path>`.
    - Accessibility subtree: `tree` with defaults first; add explicit bounds only when needed.
    - Large or user-unbounded result: `export-run --output <path>` rather than expanding synchronous limits.
    - Sensitive history: `speech-history` or `log-tail`.
@@ -24,6 +28,7 @@ python <skill-directory>/scripts/nvda_http_bridge.py health
    - Restart: `restart` only after an explicit request, then report before/after process identity and uptime.
    - Complete backup: `backup` only after an explicit request. Treat `--output` as the target folder; let NVDA HTTP Bridge create its new `nvda` child (default `./nvda`), poll completion, then delete only the HTTP job.
    - Mutation: an action command only after confirming the user's intent.
+   - Current-context gesture: read focus and `gestures-get` immediately before `gesture`; a focus change can make the same key unbound and return `409 gestureNotBound`.
 4. Summarize metadata such as node count, elapsed time, truncation reasons, and error codes. Do not dump large trees or sensitive text unless requested.
 
 Read [references/api.md](references/api.md) when choosing parameters, interpreting errors, managing exports, or diagnosing startup freezes.
@@ -34,10 +39,11 @@ Read [references/api.md](references/api.md) when choosing parameters, interpreti
 - Keep ordinary tree queries bounded. Start with the server defaults and never work around `422 exportRequired` with repeated synchronous calls.
 - Use `null` export limits only when the user explicitly requests an unrestricted dimension. Pass `--allow-unbounded`; cancel or delete the server job when finished.
 - Treat screen text, speech history, logs, and exported trees as sensitive. Store downloads only at a user-approved path.
-- Run `speak`, `cancel-speech`, `gesture`, `focus-object`, `default-action`, and `restart` only for an explicit user request or an agreed test. Never attempt NVDA quit, plugin reload, or arbitrary Python execution.
+- Run `speak`, `cancel-speech`, `gesture`, `focus-object`, `default-action`, `modes-patch`, `set-caret`, `set-selection`, and `restart` only for an explicit user request or an agreed test. Never attempt NVDA quit, plugin reload, or arbitrary Python execution.
 - Restart through the client. It uses the dedicated lifecycle endpoint when live capabilities declare it, sends the POST only once, and uses external `NVDA+Shift+Q` only for an older Bridge without that capability. Never route a lifecycle command through the generic `gesture` action. Treat dropped or incomplete responses during shutdown as temporary unavailability and keep polling. Success requires a changed NVDA PID or start time; lower Bridge uptime is not sufficient.
 - Create backups only through the asynchronous NVDA HTTP Bridge backup API by using the client's `backup` workflow. Send the chosen target folder as `targetPath`; normalize it and create a new `nvda` child, including missing target parents. Refuse an existing child, exclude any legacy credential file left by older Bridge versions, and preserve the completed backup when deleting or expiring its HTTP job.
 - Reacquire an object after UI changes or a `409 staleObject`; object IDs are short-lived and generation-scoped.
+- Treat object text and diagnostic ZIPs as sensitive. Keep text requests bounded and download diagnostic bundles only to a user-approved path.
 - Stop on `403 secureContext`. Do not bypass lock-screen or secure-desktop checks.
 - On `504 mainThreadTimeout`, inspect `health`. Do not increase timeouts or start a large tree. Follow the WTS diagnostic in the reference; changing Windows service state or restarting NVDA requires user approval.
 - Do not automatically retry mutating requests after a transport timeout because their completion may be uncertain.

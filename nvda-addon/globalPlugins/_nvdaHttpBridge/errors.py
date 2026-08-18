@@ -106,3 +106,8 @@ class SecureContext(Forbidden):
 class UnsafeAction(Conflict):
 	code = "unsafeAction"
 	default_message = "This action is intentionally unavailable over HTTP"
+
+
+class GestureNotBound(Conflict):
+	code = "gestureNotBound"
+	default_message = "The gesture is not bound in the current NVDA context"

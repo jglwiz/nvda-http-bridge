@@ -733,14 +733,86 @@ def run_export(client, args):
 	return result, 0 if error is None else 2
 
 
+def run_diagnostic_export(client, args):
+	created = client.json("POST", "/v1/diagnostics/exports", {})
+	if not is_success(created):
+		return created, 2
+	job_id = job_id_from(created)
+	terminal = None
+	download = None
+	cleanup = None
+	try:
+		deadline = time.monotonic() + args.wait_seconds
+		while time.monotonic() < deadline:
+			terminal = client.json("GET", "/v1/diagnostics/exports/" + quote(job_id, safe=""))
+			if not is_success(terminal) or (terminal.get("data") or {}).get("status") in TERMINAL_EXPORT_STATES:
+				break
+			time.sleep(args.poll_interval)
+		if terminal is None or (is_success(terminal) and (terminal.get("data") or {}).get("status") not in TERMINAL_EXPORT_STATES):
+			terminal = {
+				"httpStatus": 408,
+				"data": {"error": {"code": "clientTimeout", "message": "diagnostic export polling timed out"}},
+			}
+		if is_success(terminal) and (terminal.get("data") or {}).get("status") == "completed":
+			try:
+				download = client.download(
+					"/v1/diagnostics/exports/%s/data" % quote(job_id, safe=""),
+					args.output,
+					accept="application/zip",
+				)
+			except ClientError as error:
+				download = {
+					"httpStatus": 0,
+					"data": {"error": {"code": "clientError", "message": str(error)}},
+				}
+	finally:
+		if not args.keep_server_copy:
+			try:
+				cleanup = client.json("DELETE", "/v1/diagnostics/exports/" + quote(job_id, safe=""))
+			except ClientError as error:
+				cleanup = {"httpStatus": 0, "data": {"error": {"code": "clientError", "message": str(error)}}}
+
+	state = (terminal.get("data") or {}).get("status")
+	error = None
+	status = 200
+	if not is_success(terminal):
+		status = terminal["httpStatus"]
+		error = (terminal.get("data") or {}).get("error")
+	elif state != "completed":
+		status = 409
+		error = (terminal.get("data") or {}).get("error") or {
+			"code": "diagnosticExportIncomplete", "message": "diagnostic export ended with status %s" % state,
+		}
+	elif not download or not is_success(download):
+		status = (download or {}).get("httpStatus", 0)
+		error = ((download or {}).get("data") or {}).get("error") or {
+			"code": "downloadFailed", "message": "diagnostic export download failed",
+		}
+	elif not args.keep_server_copy and (not cleanup or not is_success(cleanup)):
+		status = (cleanup or {}).get("httpStatus", 0)
+		error = {"code": "cleanupFailed", "message": "download succeeded but the server job was not deleted"}
+	result = {
+		"httpStatus": status,
+		"data": {"jobId": job_id, "terminal": terminal.get("data"), "download": download, "cleanup": cleanup},
+	}
+	if error:
+		result["data"]["error"] = error
+	return result, 0 if error is None else 2
+
+
 def build_parser():
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("--base-url", type=validate_base_url, default=DEFAULT_BASE_URL)
 	parser.add_argument("--timeout", type=float, default=8.0)
 	sub = parser.add_subparsers(dest="command", required=True)
 
-	for command in ("health", "version", "capabilities", "cancel-speech"):
+	for command in (
+		"health", "version", "capabilities", "status", "modes-get", "cancel-speech",
+		"addons", "global-plugins", "drivers", "diagnostics",
+	):
 		sub.add_parser(command)
+	modes_patch = sub.add_parser("modes-patch")
+	modes_patch.add_argument("--body-file", type=Path, required=True)
 
 	obj = sub.add_parser("object")
 	obj.add_argument("root", choices=("focus", "foreground", "navigator", "desktop"))
@@ -749,6 +821,17 @@ def build_parser():
 	obj_id = sub.add_parser("object-id")
 	obj_id.add_argument("object_id")
 	obj_id.add_argument("--include")
+
+	for command in ("text-caret", "text-selection"):
+		text_current = sub.add_parser(command)
+		text_current.add_argument("--max-chars", type=int)
+	text_object = sub.add_parser("text-object")
+	text_object.add_argument("object_id")
+	text_object.add_argument("--offset", type=int, default=0)
+	text_object.add_argument("--max-chars", type=int)
+	for command in ("set-caret", "set-selection"):
+		text_action = sub.add_parser(command)
+		text_action.add_argument("--body-file", type=Path, required=True)
 
 	tree = sub.add_parser("tree")
 	add_tree_arguments(tree)
@@ -778,12 +861,26 @@ def build_parser():
 	run.add_argument("--poll-interval", type=float, default=0.2)
 	run.add_argument("--keep-server-copy", action="store_true")
 
+	for command in ("diagnostic-export-create",):
+		sub.add_parser(command)
+	for command in ("diagnostic-export-status", "diagnostic-export-cancel"):
+		diagnostic_job = sub.add_parser(command)
+		diagnostic_job.add_argument("job_id")
+	diagnostic_download = sub.add_parser("diagnostic-export-download")
+	diagnostic_download.add_argument("job_id")
+	diagnostic_download.add_argument("--output", type=Path, required=True)
+	diagnostic_run = sub.add_parser("diagnostic-export-run")
+	diagnostic_run.add_argument("--output", type=Path, required=True)
+	diagnostic_run.add_argument("--wait-seconds", type=float, default=30.0)
+	diagnostic_run.add_argument("--poll-interval", type=float, default=0.2)
+	diagnostic_run.add_argument("--keep-server-copy", action="store_true")
+
 	speak = sub.add_parser("speak")
 	speak.add_argument("text")
 	gesture = sub.add_parser("gesture")
 	gesture.add_argument("key")
 	restart = sub.add_parser("restart")
-	restart.add_argument("--nvda-key", choices=tuple(RESTART_KEY_CODES), default="insert")
+	restart.add_argument("--nvda-key", choices=tuple(RESTART_KEY_CODES), default="capslock")
 	restart.add_argument("--wait-seconds", type=float, default=30.0)
 	restart.add_argument("--poll-interval", type=float, default=0.25)
 	backup_create = sub.add_parser("backup-create")
@@ -825,12 +922,29 @@ def execute(client, args):
 	command = args.command
 	if command in ("health", "version", "capabilities"):
 		return client.json("GET", "/health" if command == "health" else "/v1/" + command), None
+	if command == "status":
+		return client.json("GET", "/v1/status"), None
+	if command == "modes-get":
+		return client.json("GET", "/v1/modes"), None
+	if command == "modes-patch":
+		result = client.json("PATCH", "/v1/modes", read_json_file(args.body_file))
+		return reconcile_unknown_completion(client, result, "/v1/modes"), None
+	if command in ("addons", "global-plugins", "drivers", "diagnostics"):
+		return client.json("GET", "/v1/" + command), None
 	if command == "object":
 		path = query_path("/v1/objects/" + args.root, {"include": args.include})
 		return client.json("GET", path), None
 	if command == "object-id":
 		path = query_path("/v1/objects/by-id/" + quote(args.object_id, safe=""), {"include": args.include})
 		return client.json("GET", path), None
+	if command in ("text-caret", "text-selection"):
+		position = command.split("-", 1)[1]
+		return client.json("GET", query_path("/v1/text/" + position, {"maxChars": args.max_chars})), None
+	if command == "text-object":
+		path = "/v1/text/object/" + quote(args.object_id, safe="")
+		return client.json("GET", query_path(path, {"offset": args.offset, "maxChars": args.max_chars})), None
+	if command in ("set-caret", "set-selection"):
+		return client.json("POST", "/v1/actions/" + command, read_json_file(args.body_file)), None
 	if command == "tree":
 		return client.json("GET", query_path("/v1/tree", tree_params(args))), None
 	if command in ("speech-history", "log-tail"):
@@ -848,6 +962,20 @@ def execute(client, args):
 		return client.download("/v1/tree/exports/%s/data" % quote(args.job_id, safe=""), args.output), None
 	if command == "export-run":
 		return run_export(client, args)
+	if command == "diagnostic-export-create":
+		return client.json("POST", "/v1/diagnostics/exports", {}), None
+	if command == "diagnostic-export-status":
+		return client.json("GET", "/v1/diagnostics/exports/" + quote(args.job_id, safe="")), None
+	if command == "diagnostic-export-cancel":
+		return client.json("DELETE", "/v1/diagnostics/exports/" + quote(args.job_id, safe="")), None
+	if command == "diagnostic-export-download":
+		return client.download(
+			"/v1/diagnostics/exports/%s/data" % quote(args.job_id, safe=""),
+			args.output,
+			accept="application/zip",
+		), None
+	if command == "diagnostic-export-run":
+		return run_diagnostic_export(client, args)
 	if command == "speak":
 		return client.json("POST", "/v1/actions/speak", {"text": args.text}), None
 	if command == "cancel-speech":
@@ -924,6 +1052,10 @@ def main(argv=None):
 		parser.error("--duration must be between 0.1 and 60 seconds")
 	if hasattr(args, "max_events") and not 1 <= args.max_events <= 1000:
 		parser.error("--max-events must be between 1 and 1000")
+	if hasattr(args, "max_chars") and args.max_chars is not None and not 1 <= args.max_chars <= 32768:
+		parser.error("--max-chars must be between 1 and 32768")
+	if hasattr(args, "offset") and not 0 <= args.offset <= 100000:
+		parser.error("--offset must be between 0 and 100000")
 	client = NvdaClient(args.base_url, args.timeout)
 	try:
 		result, explicit_exit = execute(client, args)

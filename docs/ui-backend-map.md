@@ -14,6 +14,18 @@
 
 `PATCH /v1/settings/general` 使用完整写前快照和 `baseRevision`。所有字段先验证后写入；语言被命令行强制时只读。登录启动、更新、日志级别、驱动和“保存全部配置”不在本阶段。
 
+## 运行模式
+
+`GET /v1/status` 与 `GET /v1/modes` 直接读取当前焦点应用、tree interceptor、输入管理器、语音合成器、盲文 handler、配置文件和屏幕幕布状态。`PATCH /v1/modes` 只允许 `inputHelp`、当前应用 `sleepMode` 和当前文档 `browseMode`，复用 NVDA 原生属性及焦点事件顺序；屏幕幕布保持只读，避免绕过其警告流程。
+
+## 文本范围
+
+文本接口通过对象的 `makeTextInfo` 和 NVDA `UNIT_CHARACTER` 移动范围，不序列化各提供者不兼容的原生 bookmark。读取受字符数与偏移上限约束；写入同时校验对象 generation 与基于当前文本范围签名的 `baseRevision`，再调用 `updateCaret()` 或 `updateSelection()`。
+
+## 诊断清单
+
+add-on、global plugin、语音合成器和盲文驱动清单直接来自 NVDA 已加载的 handler。同步端点只读；异步诊断任务在专用目录生成限额 ZIP，只包含结构化清单和有界日志尾部，不接受调用者指定的服务端文件路径。
+
 ## 朗读词典
 
 UI 依据是 `gui/speechDict.py` 的 `DictionaryDialog.onOk` 和词条编辑校验。API 使用运行版本提供的 `SpeechDictEntry`、default/voice/temp `SpeechDict` 以及词典自己的 `save()`：
@@ -56,4 +68,4 @@ HTTP route → BridgeService → 专用 adapter → MainThreadExecutor → NVDA 
 - 排队超时保证任务未执行，`completionUnknown=false`；已经开始的主线程调用超时返回 `504 mainThreadTimeout` 和 `completionUnknown=true`。
 - 客户端遇到未知完成状态后只 GET 同一资源对账，不自动重发写请求。
 - 文件保存异常时恢复内存快照并尝试恢复磁盘；因为 NVDA 保存过程未统一承诺事务原子性，接口返回 `partialFailure` 和回滚信息。
-- 本阶段没有异步 operation、202、GUI handler、`ShowModal`、消息框或 NVDA 重启接口。
+- 除树导出、备份、诊断导出和专用重启外，配置与文本操作保持同步；任何接口都不调用 `ShowModal` 或消息框。重启继续使用独立生命周期端点，绝不通过通用 gesture。

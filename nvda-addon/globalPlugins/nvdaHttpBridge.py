@@ -15,20 +15,27 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self._runtime.start()
 		except Exception:
 			log.exception("nvdaHttpBridge: initialization failed; NVDA will continue without HTTP")
-			if self._runtime is not None:
-				self._runtime.close()
-			self._runtime = None
+			self._close_runtime()
 
 	def terminate(self):
+		try:
+			self._close_runtime()
+		finally:
+			super().terminate()
+
+	def _close_runtime(self):
 		runtime = self._runtime
 		self._runtime = None
-		if runtime is not None:
+		if runtime is None:
+			return
+		try:
 			runtime.close()
-		super().terminate()
+		except Exception:
+			log.exception("nvdaHttpBridge: runtime cleanup failed")
 
 	def _event(self, event_name, obj, nextHandler):
 		try:
-			nextHandler()
+			return nextHandler()
 		finally:
 			runtime = self._runtime
 			if runtime is not None:
@@ -38,19 +45,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 					log.debugWarning("nvdaHttpBridge: unable to capture %s event" % event_name, exc_info=True)
 
 	def event_gainFocus(self, obj, nextHandler, **kwargs):
-		self._event("gainFocus", obj, nextHandler)
+		return self._event("gainFocus", obj, nextHandler)
 
 	def event_foreground(self, obj, nextHandler, **kwargs):
-		self._event("foreground", obj, nextHandler)
+		return self._event("foreground", obj, nextHandler)
 
 	def event_nameChange(self, obj, nextHandler, **kwargs):
-		self._event("nameChange", obj, nextHandler)
+		return self._event("nameChange", obj, nextHandler)
 
 	def event_valueChange(self, obj, nextHandler, **kwargs):
-		self._event("valueChange", obj, nextHandler)
+		return self._event("valueChange", obj, nextHandler)
 
 	def event_stateChange(self, obj, nextHandler, **kwargs):
-		self._event("stateChange", obj, nextHandler)
+		return self._event("stateChange", obj, nextHandler)
 
 	def event_caret(self, obj, nextHandler, **kwargs):
-		self._event("caret", obj, nextHandler)
+		return self._event("caret", obj, nextHandler)

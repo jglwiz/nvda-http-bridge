@@ -23,6 +23,12 @@ from .config import (
 	DEFAULT_TREE_DEPTH,
 	DEFAULT_TREE_NODES,
 	DEFAULT_TREE_TIMEOUT_MS,
+	DIAGNOSTICS_CREATE_RATE_LIMIT,
+	DIAGNOSTICS_CREATE_RATE_WINDOW_SECONDS,
+	DIAGNOSTICS_MAX_BYTES,
+	DIAGNOSTICS_MAX_CONCURRENT,
+	DIAGNOSTICS_MAX_RETAINED_JOBS,
+	DIAGNOSTICS_TTL_SECONDS,
 	EXPORT_CREATE_RATE_LIMIT,
 	EXPORT_CREATE_RATE_WINDOW_SECONDS,
 	EXPORT_MAX_BYTES,
@@ -79,6 +85,10 @@ class BridgeService:
 		security_state,
 		backups=None,
 		settings=None,
+		status=None,
+		text=None,
+		diagnostics=None,
+		diagnostic_exports=None,
 		speech_dictionaries=None,
 		symbol_dictionaries=None,
 		gestures=None,
@@ -94,6 +104,10 @@ class BridgeService:
 		self.security_state = security_state
 		self.backups = backups
 		self.settings = settings
+		self.status_adapter = status
+		self.text_adapter = text
+		self.diagnostics_adapter = diagnostics
+		self.diagnostic_exports = diagnostic_exports
 		self.speech_dictionaries = speech_dictionaries
 		self.symbol_dictionaries = symbol_dictionaries
 		self.gestures = gestures
@@ -111,6 +125,11 @@ class BridgeService:
 		self._backup_rate_limiter = RateLimiter(
 			limit=BACKUP_CREATE_RATE_LIMIT,
 			window_seconds=BACKUP_CREATE_RATE_WINDOW_SECONDS,
+			monotonic=self._monotonic,
+		)
+		self._diagnostics_rate_limiter = RateLimiter(
+			limit=DIAGNOSTICS_CREATE_RATE_LIMIT,
+			window_seconds=DIAGNOSTICS_CREATE_RATE_WINDOW_SECONDS,
 			monotonic=self._monotonic,
 		)
 		self._tree_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SYNC_TREES)
@@ -154,6 +173,7 @@ class BridgeService:
 			"executor": executor_metrics,
 			"exports": self.exports.metrics(),
 			"backups": self.backups.metrics() if self.backups is not None else None,
+			"diagnosticExports": self.diagnostic_exports.metrics() if self.diagnostic_exports is not None else None,
 			"objectRegistrySize": self.registry.size(),
 		}
 
@@ -222,12 +242,31 @@ class BridgeService:
 				"jobStatusRetentionSeconds": BACKUP_TTL_SECONDS,
 				"completedBackupPreserved": True,
 			},
+			"textLimits": self.text_adapter.limits() if self.text_adapter is not None else None,
+			"diagnosticExportLimits": {
+				"maxConcurrent": DIAGNOSTICS_MAX_CONCURRENT,
+				"maxBytes": DIAGNOSTICS_MAX_BYTES,
+				"maxRetainedJobs": DIAGNOSTICS_MAX_RETAINED_JOBS,
+				"createRateLimit": DIAGNOSTICS_CREATE_RATE_LIMIT,
+				"createRateWindowSeconds": DIAGNOSTICS_CREATE_RATE_WINDOW_SECONDS,
+				"retentionSeconds": DIAGNOSTICS_TTL_SECONDS,
+			},
 			"endpoints": {
+				"status": "/v1/status",
+				"modes": "/v1/modes",
 				"focus": "/v1/objects/focus",
 				"objectById": "/v1/objects/by-id/{objectId}",
 				"tree": "/v1/tree",
 				"treeExports": "/v1/tree/exports",
 				"backups": "/v1/backups",
+				"textCaret": "/v1/text/caret",
+				"textSelection": "/v1/text/selection",
+				"textObject": "/v1/text/object/{objectId}",
+				"addons": "/v1/addons",
+				"globalPlugins": "/v1/global-plugins",
+				"drivers": "/v1/drivers",
+				"diagnostics": "/v1/diagnostics",
+				"diagnosticExports": "/v1/diagnostics/exports",
 				"events": "/v1/events",
 				"settings": "/v1/settings/general",
 				"speechDictionaries": "/v1/speech-dictionaries",
@@ -246,6 +285,12 @@ class BridgeService:
 				},
 			},
 			"configurationResources": {
+				"modes": {
+					"execution": "synchronous",
+					"writableFields": ["inputHelp", "sleepMode", "browseMode"],
+					"readOnlyFields": ["screenCurtain"],
+					"persistedByEndpoint": False,
+				},
 				"settings/general": {
 					"execution": "synchronous",
 					"fields": [
@@ -270,7 +315,10 @@ class BridgeService:
 					"resetAllSupported": False,
 				},
 			},
-			"actions": ["speak", "cancel-speech", "gesture", "focus", "default-action"],
+			"actions": [
+				"speak", "cancel-speech", "gesture", "focus", "default-action",
+				"set-caret", "set-selection",
+			],
 			"eventTypes": ["gainFocus", "foreground", "nameChange", "valueChange", "stateChange", "caret", "speech"],
 		}
 
@@ -284,6 +332,15 @@ class BridgeService:
 
 	def settings_categories(self):
 		return self._configuration_call(self.settings, "categories")
+
+	def runtime_status(self):
+		return self._configuration_call(self.status_adapter, "get_status")
+
+	def modes(self):
+		return self._configuration_call(self.status_adapter, "get_modes")
+
+	def patch_modes(self, body):
+		return self._configuration_call(self.status_adapter, "patch_modes", body)
 
 	def general_settings(self):
 		return self._configuration_call(self.settings, "get_general")
@@ -342,6 +399,55 @@ class BridgeService:
 			return serialize_object(obj, include, self.registry, generation, self.adapter)
 
 		return self.executor.call(work, 1000)
+
+	def current_text(self, position, params=None):
+		self.assert_data_available()
+		if self.text_adapter is None:
+			from .errors import ServiceUnavailable
+
+			raise ServiceUnavailable("Text support is unavailable")
+		offset, max_chars = self.text_adapter.parse_window(params)
+		if offset:
+			raise ValidationError("offset is only supported for object text")
+
+		def work():
+			self.adapter.assert_safe()
+			obj = self.text_adapter.backend.caret_object()
+			self.adapter.assert_safe(obj)
+			generation = self.registry.new_generation()
+			object_id = self.registry.register(obj, generation)
+			return self.text_adapter.current(position, obj, object_id, generation, max_chars)
+
+		return self.executor.call(work, 1000)
+
+	def object_text(self, object_id, params=None):
+		self.assert_data_available()
+		if self.text_adapter is None:
+			from .errors import ServiceUnavailable
+
+			raise ServiceUnavailable("Text support is unavailable")
+		offset, max_chars = self.text_adapter.parse_window(params)
+
+		def work():
+			obj, generation = self.registry.resolve(object_id)
+			self.adapter.assert_safe(obj)
+			return self.text_adapter.object_text(obj, object_id, generation, offset, max_chars)
+
+		return self.executor.call(work, 3000)
+
+	def addons(self):
+		return self._configuration_call(self.diagnostics_adapter, "addons", timeout_ms=5000)
+
+	def global_plugins(self):
+		return self._configuration_call(self.diagnostics_adapter, "global_plugins", timeout_ms=5000)
+
+	def drivers(self):
+		return self._configuration_call(self.diagnostics_adapter, "drivers", timeout_ms=5000)
+
+	def diagnostics(self):
+		result = self._configuration_call(self.diagnostics_adapter, "snapshot", timeout_ms=5000)
+		result["bridge"] = self.health()
+		return result
 
 	@staticmethod
 	def _object_fields(params):
@@ -487,6 +593,36 @@ class BridgeService:
 	def cancel_backup(self, job_id):
 		return self.backups.cancel(job_id)
 
+	def create_diagnostic_export(self, body):
+		self.assert_data_available()
+		if not isinstance(body, dict):
+			raise BadRequest("The diagnostic export body must be a JSON object")
+		if body:
+			raise ValidationError("The diagnostic export body must be an empty object")
+		if self.diagnostic_exports is None:
+			from .errors import ServiceUnavailable
+
+			raise ServiceUnavailable("Diagnostic export support is unavailable")
+		self._diagnostics_rate_limiter.check("create")
+		return self.diagnostic_exports.create()
+
+	def diagnostic_export_status(self, job_id):
+		return self.diagnostic_exports.status(job_id)
+
+	def open_diagnostic_export_data(self, job_id):
+		self.assert_data_available()
+		return self.diagnostic_exports.open_data(job_id)
+
+	def diagnostic_export_download_allowed(self, job_id):
+		return (
+			not self._closing
+			and not self.security_state.restricted()
+			and self.diagnostic_exports.is_downloadable(job_id)
+		)
+
+	def cancel_diagnostic_export(self, job_id):
+		return self.diagnostic_exports.cancel(job_id)
+
 	def prepare_restart(self, body):
 		self.assert_data_available()
 		if not isinstance(body, dict):
@@ -554,6 +690,26 @@ class BridgeService:
 				raise ValidationError("A non-empty 'key' value is required")
 			self._validate_gesture(key)
 			return self._main_action(lambda: self.adapter.execute_gesture(key), {"ok": True, "key": key})
+		if action_name in ("set-caret", "set-selection"):
+			if self.text_adapter is None:
+				from .errors import ServiceUnavailable
+
+				raise ServiceUnavailable("Text support is unavailable")
+			object_id = body.get("objectId")
+			generation = body.get("generation")
+			if not isinstance(object_id, str) or not object_id:
+				raise ValidationError("An 'objectId' value is required")
+			if not isinstance(generation, str) or not generation:
+				raise ValidationError("A 'generation' value is required")
+
+			def text_action():
+				obj, resolved_generation = self.registry.resolve(object_id, generation)
+				self.adapter.assert_safe(obj)
+				if action_name == "set-caret":
+					return self.text_adapter.set_caret(obj, object_id, resolved_generation, body)
+				return self.text_adapter.set_selection(obj, object_id, resolved_generation, body)
+
+			return self.executor.call(text_action, 3000)
 		if action_name in ("focus", "default-action"):
 			self._validate_keys(body, {"objectId"}, optional={"generation"})
 			object_id = body.get("objectId")
@@ -634,6 +790,8 @@ class BridgeService:
 		self.exports.cancel_sensitive()
 		if self.backups is not None:
 			self.backups.cancel_sensitive()
+		if self.diagnostic_exports is not None:
+			self.diagnostic_exports.cancel_sensitive()
 
 	def begin_close(self):
 		if self._closing:
@@ -643,6 +801,8 @@ class BridgeService:
 		self.exports.cancel_sensitive()
 		if self.backups is not None:
 			self.backups.cancel_sensitive()
+		if self.diagnostic_exports is not None:
+			self.diagnostic_exports.cancel_sensitive()
 		self.speech_observer.set_enabled(False, clear=True)
 		self.events.close()
 
@@ -653,6 +813,8 @@ class BridgeService:
 		self.exports.close()
 		if self.backups is not None:
 			self.backups.close()
+		if self.diagnostic_exports is not None:
+			self.diagnostic_exports.close()
 		self.registry.clear()
 		self.speech_observer.set_enabled(False, clear=True)
 		self.events.close()

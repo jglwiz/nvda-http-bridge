@@ -159,11 +159,99 @@ class EntryEventTests(unittest.TestCase):
 		plugin._runtime = runtime
 		next_calls = []
 
-		plugin.event_gainFocus(object(), lambda: next_calls.append("next"))
+		result = plugin.event_gainFocus(object(), lambda: next_calls.append("next") or "handled")
 
 		self.assertEqual(["next"], next_calls)
+		self.assertEqual("handled", result)
 		self.assertEqual(1, runtime.capture_calls)
 		self.assertEqual(1, len(logger.warnings))
+
+	def test_next_handler_failure_is_propagated_after_capture(self):
+		logger = FakeLogger()
+		entry = self.load_entry_module(logger)
+
+		class Runtime:
+			def __init__(self):
+				self.events = []
+
+			def capture_event(self, event_name, obj):
+				self.events.append((event_name, obj))
+
+		runtime = Runtime()
+		plugin = entry.GlobalPlugin.__new__(entry.GlobalPlugin)
+		plugin._runtime = runtime
+		obj = object()
+
+		with self.assertRaisesRegex(RuntimeError, "next failed"):
+			plugin.event_caret(obj, lambda: (_ for _ in ()).throw(RuntimeError("next failed")))
+
+		self.assertEqual([("caret", obj)], runtime.events)
+
+	def test_start_failure_cleanup_failure_does_not_escape_initialization(self):
+		logger = FakeLogger()
+		entry = self.load_entry_module(logger)
+
+		class FailingRuntime:
+			def __init__(self, log):
+				self.close_calls = 0
+
+			def start(self):
+				raise RuntimeError("start failed")
+
+			def close(self):
+				self.close_calls += 1
+				raise RuntimeError("close failed")
+
+		entry.BridgeRuntime = FailingRuntime
+		plugin = entry.GlobalPlugin()
+
+		self.assertIsNone(plugin._runtime)
+
+	def test_terminate_calls_base_when_runtime_cleanup_fails(self):
+		logger = FakeLogger()
+		entry = self.load_entry_module(logger)
+		base = entry.GlobalPlugin.__mro__[1]
+		base.terminate = lambda instance: setattr(instance, "base_terminated", True)
+
+		class FailingRuntime:
+			def close(self):
+				raise RuntimeError("close failed")
+
+		plugin = entry.GlobalPlugin.__new__(entry.GlobalPlugin)
+		plugin._runtime = FailingRuntime()
+		plugin.base_terminated = False
+
+		plugin.terminate()
+
+		self.assertTrue(plugin.base_terminated)
+		self.assertIsNone(plugin._runtime)
+
+	def test_repeated_terminate_closes_runtime_only_once(self):
+		logger = FakeLogger()
+		entry = self.load_entry_module(logger)
+		base = entry.GlobalPlugin.__mro__[1]
+		base.terminate = lambda instance: setattr(
+			instance, "base_terminate_calls", instance.base_terminate_calls + 1,
+		)
+
+		class Runtime:
+			def __init__(self):
+				self.close_calls = 0
+
+			def close(self):
+				self.close_calls += 1
+
+		runtime = Runtime()
+		plugin = entry.GlobalPlugin.__new__(entry.GlobalPlugin)
+		plugin._runtime = runtime
+		plugin.base_terminate_calls = 0
+
+		plugin.terminate()
+		plugin.terminate()
+
+		self.assertEqual(1, runtime.close_calls)
+		self.assertEqual(2, plugin.base_terminate_calls)
+		self.assertIsNone(plugin._runtime)
 
 
 if __name__ == "__main__":

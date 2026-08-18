@@ -4,14 +4,17 @@ import threading
 
 from .auth import SecurityState
 from .backups import BackupManager
+from .diagnostics import DiagnosticsAdapter, DiagnosticsExportManager
 from .events import EventBuffer, SpeechObserver
 from .executor import MainThreadExecutor
 from .exports import ExportManager
 from .gestures import GesturesAdapter
 from .nvda_adapter import NvdaAdapter
 from .settings import SettingsAdapter
+from .status import StatusAdapter
 from .speech_dictionaries import SpeechDictionariesAdapter
 from .symbol_dictionaries import SymbolDictionariesAdapter
+from .text import TextAdapter
 from .serialization import ObjectRegistry
 from .server import BoundedHTTPServer
 from .service import BridgeService
@@ -34,6 +37,9 @@ class BridgeRuntime:
 		self.registry = ObjectRegistry(adapter=self.adapter)
 		self.executor = MainThreadExecutor(self.adapter.schedule)
 		self.settings = SettingsAdapter()
+		self.status = StatusAdapter()
+		self.text = TextAdapter()
+		self.diagnostics = DiagnosticsAdapter()
 		self.speech_dictionaries = SpeechDictionariesAdapter()
 		self.symbol_dictionaries = SymbolDictionariesAdapter()
 		self.gestures = GesturesAdapter()
@@ -51,6 +57,14 @@ class BridgeRuntime:
 			self.adapter.assert_safe,
 			defer_start=True,
 		)
+		self.diagnostic_exports = DiagnosticsExportManager(
+			self.executor,
+			self.diagnostics,
+			self.adapter.assert_safe,
+			self.adapter.temp_path,
+			log_path_provider=lambda: self.adapter.log_path,
+			defer_start=True,
+		)
 		self.service = BridgeService(
 			self.adapter,
 			self.executor,
@@ -61,6 +75,10 @@ class BridgeRuntime:
 			self.security,
 			backups=self.backups,
 			settings=self.settings,
+			status=self.status,
+			text=self.text,
+			diagnostics=self.diagnostics,
+			diagnostic_exports=self.diagnostic_exports,
 			speech_dictionaries=self.speech_dictionaries,
 			symbol_dictionaries=self.symbol_dictionaries,
 			gestures=self.gestures,
@@ -86,6 +104,7 @@ class BridgeRuntime:
 			self.server = BoundedHTTPServer(self.service, logger=self.log)
 			self.exports.start()
 			self.backups.start()
+			self.diagnostic_exports.start()
 			self._register_extensions()
 			self.server.start()
 			with self._lock:

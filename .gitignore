@@ -6,3 +6,6 @@ __pycache__/
 dist/
 *.nvda-addon
 *.zip
+
+# Local task plans and experiments
+task/

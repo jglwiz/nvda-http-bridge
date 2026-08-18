@@ -132,6 +132,39 @@ class FakeBackups:
 		self.calls.append(("close",))
 
 
+class FakeTextAdapter:
+	@staticmethod
+	def limits():
+		return {"maxChars": 100}
+
+	def set_caret(self, obj, object_id, generation, body):
+		return {"ok": True, "objectId": object_id, "generation": generation, "offset": body["offset"]}
+
+	def set_selection(self, obj, object_id, generation, body):
+		return {
+			"ok": True, "objectId": object_id, "generation": generation,
+			"start": body["start"], "end": body["end"],
+		}
+
+
+class FakeDiagnosticExports:
+	def __init__(self):
+		self.calls = []
+
+	def metrics(self):
+		return {"active": 0, "retained": 0}
+
+	def create(self):
+		self.calls.append(("create",))
+		return {"jobId": "diagnostic-1", "status": "queued"}
+
+	def cancel_sensitive(self):
+		self.calls.append(("cancel_sensitive",))
+
+	def close(self):
+		self.calls.append(("close",))
+
+
 class BridgeServiceActionTests(unittest.TestCase):
 	def setUp(self):
 		self.adapter = ActionAdapter()
@@ -287,6 +320,30 @@ class BridgeServiceActionTests(unittest.TestCase):
 
 		with self.assertRaises(StaleObject):
 			self.service.action("default-action", {"objectId": object_id, "generation": "wrong"})
+
+	def test_text_actions_require_generation_and_are_dispatched_to_text_adapter(self):
+		node = FakeNode("editor")
+		object_id = self.registry.register(node, "g1")
+		self.service.text_adapter = FakeTextAdapter()
+		caret = self.service.action("set-caret", {
+			"objectId": object_id, "generation": "g1", "baseRevision": "r1", "offset": 2,
+		})
+		selection = self.service.action("set-selection", {
+			"objectId": object_id, "generation": "g1", "baseRevision": "r1", "start": 1, "end": 3,
+		})
+		self.assertEqual(2, caret["offset"])
+		self.assertEqual((1, 3), (selection["start"], selection["end"]))
+		with self.assertRaises(ValidationError):
+			self.service.action("set-caret", {"objectId": object_id, "offset": 2})
+
+	def test_diagnostic_export_accepts_only_empty_body_and_is_advertised(self):
+		manager = FakeDiagnosticExports()
+		self.service.diagnostic_exports = manager
+		with self.assertRaises(ValidationError):
+			self.service.create_diagnostic_export({"path": "D:/outside"})
+		created = self.service.create_diagnostic_export({})
+		self.assertEqual("diagnostic-1", created["jobId"])
+		self.assertEqual("/v1/diagnostics/exports", self.service.capabilities()["endpoints"]["diagnosticExports"])
 
 	def test_unknown_action_and_arbitrary_non_object_body_are_rejected(self):
 		for action, body in (("import-module", {"name": "os"}), ("unknown", {})):

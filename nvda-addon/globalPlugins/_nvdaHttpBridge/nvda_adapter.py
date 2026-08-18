@@ -2,8 +2,49 @@
 
 import os
 
-from .errors import RestartBlocked, SecureContext, UnsafeAction
+from .errors import GestureNotBound, RestartBlocked, SecureContext, UnsafeAction
 from .serialization import ObjectAdapter
+
+
+_KEYBOARD_MODIFIER_NAMES = frozenset({
+	"alt",
+	"capslock",
+	"control",
+	"ctrl",
+	"insert",
+	"leftalt",
+	"leftcontrol",
+	"leftshift",
+	"leftwindows",
+	"numpadinsert",
+	"nvda",
+	"rightalt",
+	"rightcontrol",
+	"rightshift",
+	"rightwindows",
+	"shift",
+	"win",
+	"windows",
+})
+
+
+def _keyboard_gesture_name(identifier):
+	"""Convert a normalized keyboard identifier to the order expected by NVDA fromName."""
+	name = identifier.strip()
+	lowered = name.casefold()
+	if lowered.startswith("kb:"):
+		name = name[3:]
+	elif lowered.startswith("kb(") and ")" in name:
+		prefix, separator, remainder = name.partition(":")
+		if separator and prefix.casefold().startswith("kb("):
+			name = remainder
+	parts = [part for part in name.split("+") if part]
+	main_keys = [part for part in parts if part.casefold() not in _KEYBOARD_MODIFIER_NAMES]
+	if len(main_keys) != 1:
+		return name
+	main_index = parts.index(main_keys[0])
+	ordered = parts[:main_index] + parts[main_index + 1:] + [parts[main_index]]
+	return "+".join(ordered)
 
 
 class NvdaAdapter(ObjectAdapter):
@@ -116,7 +157,7 @@ class NvdaAdapter(ObjectAdapter):
 		import inputCore
 		from keyboardHandler import KeyboardInputGesture
 
-		gesture = KeyboardInputGesture.fromName(key)
+		gesture = KeyboardInputGesture.fromName(_keyboard_gesture_name(key))
 		script = gesture.script
 		if getattr(script, "__name__", "") in {
 			"script_quit",
@@ -124,7 +165,10 @@ class NvdaAdapter(ObjectAdapter):
 			"script_reloadPlugins",
 		}:
 			raise UnsafeAction("This gesture resolves to an NVDA lifecycle command")
-		inputCore.manager.executeGesture(gesture)
+		try:
+			inputCore.manager.executeGesture(gesture)
+		except inputCore.NoInputGestureAction as error:
+			raise GestureNotBound(details={"key": key}) from error
 
 	def focus_object(self, obj):
 		obj.setFocus()

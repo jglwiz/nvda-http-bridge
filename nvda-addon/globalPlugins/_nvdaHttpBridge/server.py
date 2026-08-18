@@ -29,6 +29,8 @@ _EXPORT_ROUTE = re.compile(r"^/v1/tree/exports/([A-Za-z0-9_-]+)(/data)?$")
 _BACKUP_ROUTE = re.compile(r"^/v1/backups/([A-Za-z0-9_-]+)$")
 _ACTION_ROUTE = re.compile(r"^/v1/actions/([a-z-]+)$")
 _OBJECT_ID_ROUTE = re.compile(r"^/v1/objects/by-id/([A-Za-z0-9_.-]+)$")
+_TEXT_OBJECT_ROUTE = re.compile(r"^/v1/text/object/([A-Za-z0-9_.-]+)$")
+_DIAGNOSTIC_EXPORT_ROUTE = re.compile(r"^/v1/diagnostics/exports/([A-Za-z0-9_-]+)(/data)?$")
 _SPEECH_DICTIONARY_ROUTE = re.compile(r"^/v1/speech-dictionaries/(default|voice|temp)(/validate)?$")
 _SYMBOL_DICTIONARY_ROUTE = re.compile(r"^/v1/symbol-dictionaries/([A-Za-z0-9_-]+)$")
 
@@ -241,7 +243,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 		if not self.server.request_slots.acquire(blocking=False):
 			raise TooManyRequests("The active request limit was reached")
 		try:
-			if path == "/v1/settings/categories":
+			if path == "/v1/status":
+				self._json_response(200, service.runtime_status())
+			elif path == "/v1/modes":
+				self._json_response(200, service.modes())
+			elif path == "/v1/settings/categories":
 				self._json_response(200, service.settings_categories())
 			elif path == "/v1/settings/general":
 				self._json_response(200, service.general_settings())
@@ -262,6 +268,18 @@ class RequestHandler(BaseHTTPRequestHandler):
 			elif _OBJECT_ID_ROUTE.match(path):
 				object_id = _OBJECT_ID_ROUTE.match(path).group(1)
 				self._json_response(200, service.object_by_id(object_id, params))
+			elif path in ("/v1/text/caret", "/v1/text/selection"):
+				self._json_response(200, service.current_text(path.rsplit("/", 1)[-1], params))
+			elif (match := _TEXT_OBJECT_ROUTE.match(path)):
+				self._json_response(200, service.object_text(match.group(1), params))
+			elif path == "/v1/addons":
+				self._json_response(200, service.addons())
+			elif path == "/v1/global-plugins":
+				self._json_response(200, service.global_plugins())
+			elif path == "/v1/drivers":
+				self._json_response(200, service.drivers())
+			elif path == "/v1/diagnostics":
+				self._json_response(200, service.diagnostics())
 			elif path.startswith("/v1/objects/"):
 				root = path.rsplit("/", 1)[-1]
 				self._json_response(200, service.object_snapshot(root, params))
@@ -287,6 +305,21 @@ class RequestHandler(BaseHTTPRequestHandler):
 					else:
 						self._json_response(200, service.export_status(job_id))
 				else:
+					match = _DIAGNOSTIC_EXPORT_ROUTE.match(path)
+					if match:
+						job_id, data_suffix = match.groups()
+						if data_suffix:
+							data_file, length = service.open_diagnostic_export_data(job_id)
+							self._file_response(
+								data_file,
+								length,
+								job_id + ".zip",
+								lambda: service.diagnostic_export_download_allowed(job_id),
+								"application/zip",
+							)
+						else:
+							self._json_response(200, service.diagnostic_export_status(job_id))
+						return
 					match = _BACKUP_ROUTE.match(path)
 					if match:
 						self._json_response(200, service.backup_status(match.group(1)))
@@ -320,6 +353,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 			if path == "/v1/backups":
 				self._json_response(202, service.create_backup(self._read_json()))
 				return
+			if path == "/v1/diagnostics/exports":
+				self._json_response(202, service.create_diagnostic_export(self._read_json()))
+				return
 			match = _ACTION_ROUTE.match(path)
 			if match:
 				self._json_response(200, service.action(match.group(1), self._read_json()))
@@ -333,6 +369,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 		if not self.server.request_slots.acquire(blocking=False):
 			raise TooManyRequests("The active request limit was reached")
 		try:
+			if path == "/v1/modes":
+				self._json_response(200, self.server.service.patch_modes(self._read_json()))
+				return
 			if path == "/v1/settings/general":
 				self._json_response(200, self.server.service.patch_general_settings(self._read_json()))
 				return
@@ -369,6 +408,10 @@ class RequestHandler(BaseHTTPRequestHandler):
 		match = _BACKUP_ROUTE.match(path)
 		if match:
 			self._json_response(202, self.server.service.cancel_backup(match.group(1)))
+			return
+		match = _DIAGNOSTIC_EXPORT_ROUTE.match(path)
+		if match and not match.group(2):
+			self._json_response(202, self.server.service.cancel_diagnostic_export(match.group(1)))
 			return
 		raise NotFoundError()
 

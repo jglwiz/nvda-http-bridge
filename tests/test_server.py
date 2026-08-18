@@ -6,7 +6,7 @@ import unittest
 
 from support import GLOBAL_PLUGINS  # noqa: F401
 
-from _nvdaHttpBridge.errors import Conflict
+from _nvdaHttpBridge.errors import Conflict, GestureNotBound
 from _nvdaHttpBridge.server import BoundedHTTPServer
 
 
@@ -20,6 +20,8 @@ class FakeService:
 		self.backup_calls = []
 		self.configuration_calls = []
 		self.restart_calls = []
+		self.new_api_calls = []
+		self.action_error = None
 		self.server = None
 
 	def health(self):
@@ -78,6 +80,59 @@ class FakeService:
 		self.restart_calls.append(("scheduled", restart_id, active))
 		return True
 
+	def runtime_status(self):
+		self.new_api_calls.append(("status",))
+		return {"modes": {"inputHelp": False}}
+
+	def modes(self):
+		self.new_api_calls.append(("modes",))
+		return {"revision": "m1"}
+
+	def patch_modes(self, body):
+		self.new_api_calls.append(("modes-patch", body))
+		return {"revision": "m2"}
+
+	def current_text(self, position, params):
+		self.new_api_calls.append(("text-current", position, params))
+		return {"position": position, "text": "selection"}
+
+	def object_text(self, object_id, params):
+		self.new_api_calls.append(("text-object", object_id, params))
+		return {"objectId": object_id, "text": "object"}
+
+	def addons(self):
+		self.new_api_calls.append(("addons",))
+		return {"items": []}
+
+	def global_plugins(self):
+		self.new_api_calls.append(("global-plugins",))
+		return {"items": []}
+
+	def drivers(self):
+		self.new_api_calls.append(("drivers",))
+		return {"synthesizers": {}}
+
+	def diagnostics(self):
+		self.new_api_calls.append(("diagnostics",))
+		return {"addons": []}
+
+	def create_diagnostic_export(self, body):
+		self.new_api_calls.append(("diagnostics-create", body))
+		return {"jobId": "diagnostic-created", "status": "queued"}
+
+	def diagnostic_export_status(self, job_id):
+		self.new_api_calls.append(("diagnostics-status", job_id))
+		return {"jobId": job_id, "status": "completed"}
+
+	def cancel_diagnostic_export(self, job_id):
+		self.new_api_calls.append(("diagnostics-cancel", job_id))
+		return {"jobId": job_id, "status": "canceled"}
+
+	def action(self, action_name, body):
+		if self.action_error is not None:
+			raise self.action_error
+		return {"ok": True, "action": action_name, "body": body}
+
 
 class BoundedHTTPServerTests(unittest.TestCase):
 	def setUp(self):
@@ -92,6 +147,24 @@ class BoundedHTTPServerTests(unittest.TestCase):
 
 	def tearDown(self):
 		self.server.stop()
+
+	def test_unbound_gesture_returns_structured_conflict(self):
+		self.service.action_error = GestureNotBound(details={"key": "NVDA+control+upArrow"})
+		connection = self.connection()
+		try:
+			connection.request(
+				"POST",
+				"/v1/actions/gesture",
+				body='{"key":"NVDA+control+upArrow"}',
+				headers={"Content-Type": "application/json"},
+			)
+			response = connection.getresponse()
+			payload = json.loads(response.read().decode("utf-8"))
+		finally:
+			connection.close()
+		self.assertEqual(409, response.status)
+		self.assertEqual("gestureNotBound", payload["error"]["code"])
+		self.assertEqual("NVDA+control+upArrow", payload["error"]["details"]["key"])
 
 	def connection(self):
 		return http.client.HTTPConnection(self.host, self.port, timeout=2)
@@ -298,6 +371,37 @@ class BoundedHTTPServerTests(unittest.TestCase):
 		self.assertEqual([200, 200, 200, 200], [get_response.status, patch_response.status, validate_response.status, put_response.status])
 		self.assertIn(("general-get",), self.service.configuration_calls)
 		self.assertIn(("speech-put", "default", {"baseRevision": "d1", "entries": []}), self.service.configuration_calls)
+
+	def test_status_text_and_diagnostic_routes_are_explicit_and_unauthenticated(self):
+		connection = self.connection()
+		headers = {"Content-Type": "application/json"}
+		requests = (
+			("GET", "/v1/status", None, 200),
+			("GET", "/v1/modes", None, 200),
+			("PATCH", "/v1/modes", '{"baseRevision":"m1","values":{"inputHelp":true}}', 200),
+			("GET", "/v1/text/selection?maxChars=20", None, 200),
+			("GET", "/v1/text/object/object.1?offset=2", None, 200),
+			("GET", "/v1/addons", None, 200),
+			("GET", "/v1/global-plugins", None, 200),
+			("GET", "/v1/drivers", None, 200),
+			("GET", "/v1/diagnostics", None, 200),
+			("POST", "/v1/diagnostics/exports", "{}", 202),
+			("GET", "/v1/diagnostics/exports/diagnostic-created", None, 200),
+			("DELETE", "/v1/diagnostics/exports/diagnostic-created", None, 202),
+		)
+		try:
+			statuses = []
+			for method, path, body, expected in requests:
+				connection.request(method, path, body=body, headers=headers)
+				response = connection.getresponse()
+				response.read()
+				statuses.append((response.status, expected))
+		finally:
+			connection.close()
+		self.assertTrue(all(actual == expected for actual, expected in statuses))
+		self.assertIn(("text-current", "selection", {"maxChars": ["20"]}), self.service.new_api_calls)
+		self.assertIn(("text-object", "object.1", {"offset": ["2"]}), self.service.new_api_calls)
+		self.assertIn(("diagnostics-create", {}), self.service.new_api_calls)
 
 
 if __name__ == "__main__":

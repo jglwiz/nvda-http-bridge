@@ -107,6 +107,24 @@ class ConfigurationCommandTests(unittest.TestCase):
 		self.assertEqual("/v1/gestures?context=current&filter=time", client.calls[0][1])
 		self.assertEqual("/v1/speech-dictionaries/voice", client.calls[1][1])
 
+	def test_status_text_modes_and_inventory_commands_use_explicit_routes(self):
+		client = self.Client()
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["status"]))
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["text-object", "obj.1", "--offset", "2", "--max-chars", "20"]))
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["global-plugins"]))
+		self.assertEqual("/v1/status", client.calls[0][1])
+		self.assertEqual("/v1/text/object/obj.1?offset=2&maxChars=20", client.calls[1][1])
+		self.assertEqual("/v1/global-plugins", client.calls[2][1])
+
+	def test_modes_patch_and_text_actions_read_structured_body_files(self):
+		with tempfile.TemporaryDirectory() as temporary:
+			body_file = Path(temporary) / "body.json"
+			body_file.write_text('{"objectId":"o","generation":"g","baseRevision":"r","offset":1}', encoding="utf-8")
+			client = self.Client()
+			nvda_http.execute(client, nvda_http.build_parser().parse_args(["set-caret", "--body-file", str(body_file)]))
+		self.assertEqual("POST", client.calls[0][0])
+		self.assertEqual("/v1/actions/set-caret", client.calls[0][1])
+
 
 class RestartTests(unittest.TestCase):
 	def test_restart_uses_http_once_and_requires_new_process_identity(self):
@@ -188,7 +206,7 @@ class RestartTests(unittest.TestCase):
 		sent = []
 		result, exit_code = nvda_http.run_restart(client, args, sender=sent.append, clock=clock, sleep=clock.sleep)
 		self.assertEqual(0, exit_code)
-		self.assertEqual(["insert"], sent)
+		self.assertEqual(["capslock"], sent)
 		self.assertEqual("externalHotkey", result["data"]["method"])
 
 	def test_declared_endpoint_transport_error_is_not_retried_or_fallback(self):
@@ -314,6 +332,34 @@ class BackupTests(unittest.TestCase):
 				[("POST", "/v1/backups", {"targetPath": str(target.resolve())})],
 				client.calls,
 			)
+
+
+class DiagnosticExportTests(unittest.TestCase):
+	class Client:
+		def __init__(self):
+			self.calls = []
+
+		def json(self, method, path, body=None):
+			self.calls.append((method, path, body))
+			if method == "POST":
+				return {"httpStatus": 202, "data": {"jobId": "d1", "status": "queued"}}
+			if method == "GET":
+				return {"httpStatus": 200, "data": {"jobId": "d1", "status": "completed"}}
+			return {"httpStatus": 202, "data": {"jobId": "d1", "status": "canceled"}}
+
+		def download(self, path, output, accept=None):
+			self.calls.append(("DOWNLOAD", path, str(output), accept))
+			return {"httpStatus": 200, "data": {"output": str(output), "bytes": 10}}
+
+	def test_run_polls_downloads_zip_and_deletes_server_job(self):
+		args = nvda_http.build_parser().parse_args(["diagnostic-export-run", "--output", "diagnostics.zip"])
+		client = self.Client()
+		result, exit_code = nvda_http.run_diagnostic_export(client, args)
+		self.assertEqual(0, exit_code)
+		self.assertEqual(200, result["httpStatus"])
+		self.assertIn(("POST", "/v1/diagnostics/exports", {}), client.calls)
+		self.assertIn(("DOWNLOAD", "/v1/diagnostics/exports/d1/data", "diagnostics.zip", "application/zip"), client.calls)
+		self.assertIn(("DELETE", "/v1/diagnostics/exports/d1", None), client.calls)
 
 
 if __name__ == "__main__":
