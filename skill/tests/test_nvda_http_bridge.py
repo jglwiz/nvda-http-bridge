@@ -12,8 +12,21 @@ nvda_http = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(nvda_http)
 
 
-def health(uptime, status="ok"):
-	return {"httpStatus": 200, "data": {"status": status, "uptimeMs": uptime}}
+def health(uptime, status="ok", pid=10, started=100.0):
+	return {
+		"httpStatus": 200,
+		"data": {
+			"status": status,
+			"uptimeMs": uptime,
+			"nvdaProcessId": pid,
+			"nvdaStartTime": started,
+		},
+	}
+
+
+def capabilities(restart=True):
+	data = {"lifecycle": {"restart": {"endpoint": "/v1/lifecycle/restart"}}} if restart else {}
+	return {"httpStatus": 200, "data": data}
 
 
 class FakeClock:
@@ -32,23 +45,11 @@ class SequenceClient:
 		self.responses = iter(responses)
 		self.timeout = 8.0
 
-	def json(self, method, path):
+	def json(self, method, path, body=None):
 		response = next(self.responses)
 		if isinstance(response, Exception):
 			raise response
 		return response
-
-
-class TokenFileTests(unittest.TestCase):
-	def test_default_token_uses_the_canonical_name(self):
-		with tempfile.TemporaryDirectory() as temporary:
-			token_root = Path(temporary) / "nvda"
-			token_root.mkdir()
-			(token_root / "nvdaHttpBridge.token").write_text("current-token", encoding="ascii")
-			client = nvda_http.NvdaClient("http://127.0.0.1:19281", None, 1.0)
-
-			with patch.dict(nvda_http.os.environ, {"APPDATA": temporary}):
-				self.assertEqual("current-token", client._read_token())
 
 
 class ClientTransportTests(unittest.TestCase):
@@ -72,12 +73,67 @@ class ClientTransportTests(unittest.TestCase):
 		self.assertTrue(response.closed)
 
 
+class ConfigurationCommandTests(unittest.TestCase):
+	class Client:
+		def __init__(self, first=None):
+			self.calls = []
+			self.first = first
+
+		def json(self, method, path, body=None):
+			self.calls.append((method, path, body))
+			if len(self.calls) == 1 and self.first is not None:
+				return self.first
+			return {"httpStatus": 200, "data": {"revision": "actual"}}
+
+	def test_settings_set_reads_structured_body_and_reconciles_running_timeout(self):
+		unknown = {
+			"httpStatus": 504,
+			"data": {"error": {"code": "mainThreadTimeout", "details": {"completionUnknown": True}}},
+		}
+		with tempfile.TemporaryDirectory() as temporary:
+			body_file = Path(temporary) / "settings.json"
+			body_file.write_text('{"baseRevision":"old","values":{"askToExit":false}}', encoding="utf-8")
+			args = nvda_http.build_parser().parse_args(["settings-set", "--body-file", str(body_file)])
+			client = self.Client(unknown)
+			result, unused_exit = nvda_http.execute(client, args)
+		self.assertEqual("actual", result["reconciliation"]["data"]["revision"])
+		self.assertEqual("PATCH", client.calls[0][0])
+		self.assertEqual("GET", client.calls[1][0])
+
+	def test_gesture_and_dictionary_commands_use_resource_specific_routes(self):
+		client = self.Client()
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["gestures-get", "--filter", "time"]))
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["speech-dictionary-get", "voice"]))
+		self.assertEqual("/v1/gestures?context=current&filter=time", client.calls[0][1])
+		self.assertEqual("/v1/speech-dictionaries/voice", client.calls[1][1])
+
+	def test_status_text_modes_and_inventory_commands_use_explicit_routes(self):
+		client = self.Client()
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["status"]))
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["text-object", "obj.1", "--offset", "2", "--max-chars", "20"]))
+		nvda_http.execute(client, nvda_http.build_parser().parse_args(["global-plugins"]))
+		self.assertEqual("/v1/status", client.calls[0][1])
+		self.assertEqual("/v1/text/object/obj.1?offset=2&maxChars=20", client.calls[1][1])
+		self.assertEqual("/v1/global-plugins", client.calls[2][1])
+
+	def test_modes_patch_and_text_actions_read_structured_body_files(self):
+		with tempfile.TemporaryDirectory() as temporary:
+			body_file = Path(temporary) / "body.json"
+			body_file.write_text('{"objectId":"o","generation":"g","baseRevision":"r","offset":1}', encoding="utf-8")
+			client = self.Client()
+			nvda_http.execute(client, nvda_http.build_parser().parse_args(["set-caret", "--body-file", str(body_file)]))
+		self.assertEqual("POST", client.calls[0][0])
+		self.assertEqual("/v1/actions/set-caret", client.calls[0][1])
+
+
 class RestartTests(unittest.TestCase):
-	def test_restart_sends_external_hotkey_and_requires_lower_uptime(self):
+	def test_restart_uses_http_once_and_requires_new_process_identity(self):
 		client = SequenceClient([
 			health(10000),
+			capabilities(),
+			{"httpStatus": 202, "data": {"status": "accepted", "restartId": "r1"}},
 			nvda_http.ClientError("bridge unavailable"),
-			health(250),
+			health(250, pid=11, started=101.0),
 		])
 		args = nvda_http.build_parser().parse_args(["restart"])
 		clock = FakeClock()
@@ -92,8 +148,10 @@ class RestartTests(unittest.TestCase):
 		)
 
 		self.assertEqual(0, exit_code)
-		self.assertEqual(["insert"], sent)
+		self.assertEqual([], sent)
 		self.assertEqual("restarted", result["data"]["status"])
+		self.assertEqual("http", result["data"]["method"])
+		self.assertEqual("r1", result["data"]["restartId"])
 		self.assertEqual(10000.0, result["data"]["beforeUptimeMs"])
 		self.assertEqual(250.0, result["data"]["afterUptimeMs"])
 		self.assertTrue(result["data"]["observedUnavailable"])
@@ -103,8 +161,12 @@ class RestartTests(unittest.TestCase):
 		class StableClient:
 			timeout = 8.0
 
-			def json(self, method, path):
-				return health(10000)
+			def json(self, method, path, body=None):
+				if path == "/v1/capabilities":
+					return capabilities()
+				if method == "POST":
+					return {"httpStatus": 202, "data": {"restartId": "r1"}}
+				return health(100 if method == "GET" else 10000)
 
 		args = nvda_http.build_parser().parse_args([
 			"restart",
@@ -123,6 +185,42 @@ class RestartTests(unittest.TestCase):
 		self.assertEqual(2, exit_code)
 		self.assertEqual(408, result["httpStatus"])
 		self.assertEqual("restartTimeout", result["data"]["error"]["code"])
+
+	def test_uptime_reset_without_identity_change_is_not_success(self):
+		client = SequenceClient([
+			health(10000), capabilities(), {"httpStatus": 202, "data": {"restartId": "r1"}},
+			health(10), health(20),
+		])
+		args = nvda_http.build_parser().parse_args(["restart", "--wait-seconds", "0.2", "--poll-interval", "0.1"])
+		clock = FakeClock()
+		result, exit_code = nvda_http.run_restart(client, args, clock=clock, sleep=clock.sleep)
+		self.assertEqual(2, exit_code)
+		self.assertEqual("restartTimeout", result["data"]["error"]["code"])
+
+	def test_old_bridge_without_capability_uses_external_hotkey(self):
+		client = SequenceClient([
+			health(10000), capabilities(False), health(200, pid=11, started=101.0),
+		])
+		args = nvda_http.build_parser().parse_args(["restart"])
+		clock = FakeClock()
+		sent = []
+		result, exit_code = nvda_http.run_restart(client, args, sender=sent.append, clock=clock, sleep=clock.sleep)
+		self.assertEqual(0, exit_code)
+		self.assertEqual(["capslock"], sent)
+		self.assertEqual("externalHotkey", result["data"]["method"])
+
+	def test_declared_endpoint_transport_error_is_not_retried_or_fallback(self):
+		client = SequenceClient([
+			health(10000), capabilities(), nvda_http.ClientError("incomplete response"),
+			health(200, pid=11, started=101.0),
+		])
+		args = nvda_http.build_parser().parse_args(["restart"])
+		clock = FakeClock()
+		sent = []
+		result, exit_code = nvda_http.run_restart(client, args, sender=sent.append, clock=clock, sleep=clock.sleep)
+		self.assertEqual(0, exit_code)
+		self.assertEqual([], sent)
+		self.assertTrue(result["data"]["postCompletionUnknown"])
 
 	def test_restart_rejects_unhealthy_baseline_before_sending_keys(self):
 		client = SequenceClient([health(10000, status="degraded")])
@@ -146,8 +244,8 @@ class BackupTests(unittest.TestCase):
 			self.calls = []
 			self.backup_path = None
 
-		def json(self, method, path, body=None, token_mode="none"):
-			self.calls.append((method, path, body, token_mode))
+		def json(self, method, path, body=None):
+			self.calls.append((method, path, body))
 			if method == "POST":
 				self.backup_path = str(Path(body["targetPath"]) / "nvda")
 				output = Path(self.backup_path)
@@ -189,10 +287,10 @@ class BackupTests(unittest.TestCase):
 			self.assertEqual(b"portable", (output / "nvda.exe").read_bytes())
 			self.assertEqual("config", (output / "userConfig" / "nvda.ini").read_text(encoding="utf-8"))
 			self.assertIn(
-				("POST", "/v1/backups", {"targetPath": str(target.resolve())}, "required"),
+				("POST", "/v1/backups", {"targetPath": str(target.resolve())}),
 				client.calls,
 			)
-			self.assertIn(("DELETE", "/v1/backups/backup-1", None, "required"), client.calls)
+			self.assertIn(("DELETE", "/v1/backups/backup-1", None), client.calls)
 
 	def test_backup_refuses_existing_destination(self):
 		with tempfile.TemporaryDirectory() as temporary:
@@ -216,8 +314,8 @@ class BackupTests(unittest.TestCase):
 			def __init__(self):
 				self.calls = []
 
-			def json(self, method, path, body=None, token_mode="none"):
-				self.calls.append((method, path, body, token_mode))
+			def json(self, method, path, body=None):
+				self.calls.append((method, path, body))
 				return {"httpStatus": 202, "data": {"jobId": "backup-1"}}
 
 		with tempfile.TemporaryDirectory() as temporary:
@@ -231,9 +329,37 @@ class BackupTests(unittest.TestCase):
 			nvda_http.execute(client, args)
 
 			self.assertEqual(
-				[("POST", "/v1/backups", {"targetPath": str(target.resolve())}, "required")],
+				[("POST", "/v1/backups", {"targetPath": str(target.resolve())})],
 				client.calls,
 			)
+
+
+class DiagnosticExportTests(unittest.TestCase):
+	class Client:
+		def __init__(self):
+			self.calls = []
+
+		def json(self, method, path, body=None):
+			self.calls.append((method, path, body))
+			if method == "POST":
+				return {"httpStatus": 202, "data": {"jobId": "d1", "status": "queued"}}
+			if method == "GET":
+				return {"httpStatus": 200, "data": {"jobId": "d1", "status": "completed"}}
+			return {"httpStatus": 202, "data": {"jobId": "d1", "status": "canceled"}}
+
+		def download(self, path, output, accept=None):
+			self.calls.append(("DOWNLOAD", path, str(output), accept))
+			return {"httpStatus": 200, "data": {"output": str(output), "bytes": 10}}
+
+	def test_run_polls_downloads_zip_and_deletes_server_job(self):
+		args = nvda_http.build_parser().parse_args(["diagnostic-export-run", "--output", "diagnostics.zip"])
+		client = self.Client()
+		result, exit_code = nvda_http.run_diagnostic_export(client, args)
+		self.assertEqual(0, exit_code)
+		self.assertEqual(200, result["httpStatus"])
+		self.assertIn(("POST", "/v1/diagnostics/exports", {}), client.calls)
+		self.assertIn(("DOWNLOAD", "/v1/diagnostics/exports/d1/data", "diagnostics.zip", "application/zip"), client.calls)
+		self.assertIn(("DELETE", "/v1/diagnostics/exports/d1", None), client.calls)
 
 
 if __name__ == "__main__":

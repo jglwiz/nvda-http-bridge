@@ -1,4 +1,4 @@
 interface:
   display_name: "NVDA"
-  short_description: "Inspect, control, restart, and back up local NVDA"
-  default_prompt: "Use $nvda to inspect, safely restart, or completely back up the local NVDA screen reader."
+  short_description: "Inspect, diagnose, control, restart, and back up NVDA"
+  default_prompt: "Use $nvda to inspect or diagnose local NVDA, perform an explicitly requested safe action, restart it, or create a complete backup."

@@ -78,6 +78,11 @@ class FakeAdapter:
 
 	def __init__(self):
 		self.reads = []
+		self.process_id = 1234
+		self.start_time = 1000.0
+
+	def nvda_identity(self):
+		return {"nvdaProcessId": self.process_id, "nvdaStartTime": self.start_time}
 
 	def identity(self, obj):
 		return obj.identity

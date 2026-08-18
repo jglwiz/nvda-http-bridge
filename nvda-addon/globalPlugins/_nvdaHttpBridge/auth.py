@@ -1,14 +1,10 @@
 """Loopback authentication, host validation, and secure-session state."""
 
 from collections import defaultdict, deque
-import hmac
-import os
 import threading
 import time
 
-from .config import TOKEN_FILE_NAME
-from .errors import Forbidden, TooManyRequests, Unauthorized
-from .ids import token_urlsafe
+from .errors import Forbidden, TooManyRequests
 
 
 class SecurityState:
@@ -42,52 +38,6 @@ class SecurityState:
 				"unknown": self._unknown,
 				"restricted": self._locked or self._secure_desktop or self._unknown,
 			}
-
-
-class TokenManager:
-	def __init__(self, config_path, token=None):
-		self.path = os.path.join(config_path, TOKEN_FILE_NAME)
-		self.token = token or self._load_or_create()
-
-	def _load_or_create(self):
-		token = None
-		try:
-			with open(self.path, "r", encoding="ascii") as token_file:
-				candidate = token_file.read().strip()
-			if len(candidate) >= 32:
-				token = candidate
-		except OSError:
-			pass
-		if token is None:
-			token = token_urlsafe(32)
-		self._publish(self.path, token)
-		return token
-
-	@staticmethod
-	def _publish(path, token):
-		temp_path = "%s.%s.tmp" % (path, os.getpid())
-		try:
-			os.makedirs(os.path.dirname(path), exist_ok=True)
-			with open(temp_path, "x", encoding="ascii") as token_file:
-				token_file.write(token)
-			os.chmod(temp_path, 0o600)
-			os.replace(temp_path, path)
-		except OSError:
-			try:
-				os.remove(temp_path)
-			except OSError:
-				pass
-
-	def authorize(self, supplied):
-		if not supplied or not hmac.compare_digest(self.token, supplied):
-			raise Unauthorized()
-
-
-def extract_token(headers):
-	authorization = headers.get("Authorization", "")
-	if authorization.lower().startswith("bearer "):
-		return authorization[7:].strip()
-	return headers.get("X-NVDA-HTTP-Token", "").strip()
 
 
 def validate_host(host_header, port):

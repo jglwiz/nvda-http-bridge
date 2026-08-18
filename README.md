@@ -1,160 +1,280 @@
 # NVDA HTTP Bridge
 
-NVDA HTTP Bridge 是一个仅监听本机回环地址的 NVDA 全局插件。它为 CLI、自动化测试和 agent 提供版本化的焦点、对象、语音、事件、树查询和受控动作 API。
+English | [简体中文](README.zh-CN.md)
 
-## 命名
+NVDA HTTP Bridge is a loopback-only NVDA global plugin that exposes selected NVDA internals through a controlled, versioned HTTP API.
 
-- 项目名称使用 **NVDA HTTP Bridge**，仓库目录使用 `nvda-http-bridge`。
-- `NVDA CLI` 仅适合描述本仓库中的客户端，不足以涵盖 NVDA 插件、HTTP API 和 Codex skill，因此不作为项目名。
-- NVDA add-on ID、源码文件、实现包和构建产物统一使用 `nvdaHttpBridge`。
-- token 文件名固定为 `nvdaHttpBridge.token`。
+## Why this project exists
 
-## 仓库结构
+NVDA provides rich internal APIs, but they normally live inside the NVDA process and are available only to add-ons. **NVDA HTTP Bridge turns the parts that are useful for automation into local network APIs for coding tools such as Codex and Claude.**
+
+This gives a coding agent enough structured context to help with:
+
+- investigating NVDA internals, runtime failures, speech history, and logs;
+- inspecting focus, accessible objects, text, and accessibility trees;
+- reading or changing explicitly supported NVDA settings;
+- diagnosing installed add-ons, global plugins, and drivers;
+- developing, testing, and validating NVDA add-ons;
+- following live focus, state, caret, and speech events during a bounded test.
+
+The Bridge is not a general-purpose remote-control server. It does not expose `eval`, arbitrary Python execution, arbitrary module imports, or general filesystem access. It listens only on `127.0.0.1`, validates every request against a strict schema, enforces resource limits, and rejects data and action requests on the lock screen or secure desktop.
+
+For the mapping between NVDA configuration APIs and their UI counterparts, see [docs/ui-backend-map.md](docs/ui-backend-map.md). Configuration endpoints call NVDA's own configuration objects and persistence paths; they do not simulate the Settings UI.
+
+## Highlights
+
+- **Agent-friendly discovery:** version and capability endpoints describe the live API and its limits.
+- **Accessible context:** inspect focus, foreground, navigator, and desktop objects; read bounded text and trees.
+- **Troubleshooting:** query runtime status, speech history, the NVDA log tail, add-ons, plugins, drivers, and diagnostics.
+- **Configuration support:** work with selected general settings, runtime modes, speech dictionaries, symbol pronunciation, and input gestures.
+- **Development workflows:** subscribe to events, export large trees, create bounded diagnostic bundles, and restart NVDA through its native lifecycle API.
+- **Safe client:** the bundled standard-library CLI is suitable for Codex skills, Claude tool workflows, scripts, and CI-like local checks.
+- **Defensive limits:** main-thread work is sliced and bounded; synchronous responses, exports, text access, and retained jobs all have hard caps.
+
+## Naming
+
+- The project name is **NVDA HTTP Bridge**; the repository directory is `nvda-http-bridge`.
+- `NVDA CLI` describes only the bundled client and does not cover the NVDA plugin, HTTP API, or Codex skill, so it is not used as the project name.
+- The NVDA add-on ID, entry module, implementation package, and package artifact use `nvdaHttpBridge`.
+
+## Requirements
+
+- Windows with NVDA 2025.3 or later
+- PowerShell for the build script
+- Python 3 for the bundled CLI and test suite
+
+The current manifest reports NVDA 2026.1 as the latest tested version.
+
+## Repository layout
 
 ```text
-nvda-addon/  NVDA 全局插件源码与 manifest
-skill/       Codex skill 与安全 CLI 客户端
-tests/       HTTP Bridge 单元测试
-dist/        本地构建产物（不纳入 Git）
-build.ps1    NVDA add-on 打包脚本
+nvda-addon/  NVDA global plugin sources and manifest
+skill/       Codex skill and safe CLI client
+tests/       HTTP Bridge unit tests
+docs/        Design and UI/backend mapping notes
+dist/        Local build artifacts (not tracked by Git)
+build.ps1    NVDA add-on packaging script
 ```
 
-## 安全与性能原则
+## Quick start
 
-- 只监听 `127.0.0.1:19281`，拒绝非回环 `Host`。
-- 普通树查询默认限制为深度 3、每个父节点 20 个子节点、总计 200 个节点和 500 ms 软时间预算；同步 JSON 结果另有 2 MiB 总预算。
-- 同步查询最多允许 1000 个节点和 3 秒；遍历仍以最多 25 个节点或约 20 ms 的主线程切片执行，更大的请求必须使用异步导出。
-- 完整树导出按批次读取 NVDAObject，并以 NDJSON 写入临时文件，不在内存中构造完整树。
-- UIA/IA2 的单个属性调用无法安全中断；时间预算会在调用前和批次之间检查，但不是硬实时保证。
-- Windows 锁屏或进入安全桌面时，插件拒绝数据和动作请求，清空语音/事件/对象缓存，并取消导出与备份。
-- 完整备份由插件异步直写到调用者指定目标中的全新 `nvda` 子目录，不生成中转 ZIP，也不提供任意精确输出路径。
-- 插件不提供 `eval`、任意 Python 调用、任意模块导入或通用文件访问。
-- 浏览器跨站 `Origin` / `Sec-Fetch-Site` 请求会在进入 NVDA 主线程前被拒绝。
+### 1. Install for development
 
-## 安装
-
-开发调试时，将以下内容复制到 NVDA scratchpad 的 `globalPlugins` 目录：
+Copy these items from `nvda-addon/globalPlugins/` into NVDA's scratchpad `globalPlugins` directory:
 
 ```text
 nvdaHttpBridge.py
 _nvdaHttpBridge/
 ```
 
-然后在 NVDA 高级设置中启用 Developer Scratchpad，并重启 NVDA 或手动重载插件。
+Enable **Developer Scratchpad Directory** in NVDA's Advanced settings, then restart NVDA or reload plugins during development.
 
-正式打包时使用 `nvda-addon/manifest.ini` 与 `nvda-addon/globalPlugins/`。
+For a packaged installation, build the add-on:
 
 ```powershell
 .\build.ps1
 ```
 
-产物写入 `dist/nvdaHttpBridge-1.0.0.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
-
-启动后，写操作 token 位于：
+The default artifact is written to:
 
 ```text
-%APPDATA%\nvda\nvdaHttpBridge.token
+dist/nvdaHttpBridge-1.4.0.nvda-addon
 ```
 
-token 必须通过以下任一请求头发送，禁止放入 URL。写操作、语音历史、日志、事件流和所有导出接口始终要求 token；普通对象与有界树读取是否要求 token 可由插件配置控制，当前默认仅限回环访问。
+The build excludes `__pycache__` directories and `.pyc` files.
 
-```text
-Authorization: Bearer <token>
-X-NVDA-HTTP-Token: <token>
+### 2. Check the running Bridge
+
+Use the bundled client when possible:
+
+```powershell
+python skill/scripts/nvda_http_bridge.py health
+python skill/scripts/nvda_http_bridge.py capabilities
+python skill/scripts/nvda_http_bridge.py status
+python skill/scripts/nvda_http_bridge.py object focus --include name,role,className,appName
 ```
 
-## 基础接口
+Or call the read-only discovery endpoints directly:
 
 ```powershell
 curl.exe http://127.0.0.1:19281/health
 curl.exe http://127.0.0.1:19281/v1/version
 curl.exe http://127.0.0.1:19281/v1/capabilities
+curl.exe http://127.0.0.1:19281/v1/status
 curl.exe http://127.0.0.1:19281/v1/objects/focus
 ```
 
-`/v1/capabilities` 是默认限制、同步硬上限、字段、动作和事件类型的权威来源。
+`GET /v1/capabilities` is the authoritative source for the limits, fields, actions, event types, and optional behavior supported by the running version.
 
-## 有界树查询
+## Using the Bridge with coding agents
 
-默认查询：
+The `skill/` directory contains a Codex-compatible skill, a dependency-free Python client, and an API reference. A coding agent can use the client as a narrow tool boundary instead of constructing requests or importing NVDA internals itself.
 
-```powershell
-curl.exe "http://127.0.0.1:19281/v1/tree?root=focus"
-```
-
-显式扩大范围并只读取指定字段：
+A typical diagnostic workflow is:
 
 ```powershell
-curl.exe "http://127.0.0.1:19281/v1/tree?root=foreground&depth=6&maxChildren=100&maxNodes=800&timeoutMs=2500&format=flat&include=name,role,states,className"
+# Confirm identity and discover the live contract.
+python skill/scripts/nvda_http_bridge.py health
+python skill/scripts/nvda_http_bridge.py capabilities
+
+# Read the smallest amount of context needed for the task.
+python skill/scripts/nvda_http_bridge.py status
+python skill/scripts/nvda_http_bridge.py object focus --include name,role,className,appName
+python skill/scripts/nvda_http_bridge.py log-tail
+
+# Inspect a bounded accessibility subtree when object context is not enough.
+python skill/scripts/nvda_http_bridge.py tree --root focus
 ```
 
-响应包含：
+Codex can use the bundled skill instructions directly. Claude and other programming tools can call the same CLI or local HTTP contract from an approved tool environment. Agents should always discover live capabilities first, request only the context they need, and require explicit user intent before mutations, actions, backups, or restarts.
 
-- `generation`
-- 实际使用的 `limits`
-- `nodeCount` 与 `elapsedMs`
-- `truncated` 与 `truncationReasons`
-- `tree`
+See [skill/references/api.md](skill/references/api.md) for the client command matrix, error semantics, and export lifecycle.
 
-可能的截断原因包括 `depthLimit`、`childLimit`、`nodeLimit`、`timeLimit`、`sizeLimit` 和 `cycleDetected`。
+## API overview
 
-## 异步完整树导出
-
-超过同步硬上限时，接口返回 `422 exportRequired`。创建导出任务需要 token：
-
-```powershell
-$token = Get-Content "$env:APPDATA\nvda\nvdaHttpBridge.token" -Raw
-$headers = @{ Authorization = "Bearer $($token.Trim())" }
-$body = @{
-  root = "foreground"
-  depth = $null
-  maxChildren = $null
-  maxNodes = $null
-  include = @("name", "role", "states", "className", "appName")
-  format = "flat"
-} | ConvertTo-Json
-
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19281/v1/tree/exports `
-  -Headers $headers -ContentType application/json -Body $body
-```
-
-任务接口：
+All business endpoints are under `/v1`. No credentials are required.
 
 ```text
-POST   /v1/tree/exports
-GET    /v1/tree/exports/{jobId}
-GET    /v1/tree/exports/{jobId}/data
-DELETE /v1/tree/exports/{jobId}
+GET   /health
+GET   /v1/version
+GET   /v1/capabilities
+
+GET   /v1/status
+GET   /v1/modes
+PATCH /v1/modes
+
+GET   /v1/objects/{focus|foreground|navigator|desktop}
+GET   /v1/objects/by-id/{objectId}
+GET   /v1/tree
+
+GET   /v1/text/caret
+GET   /v1/text/selection
+GET   /v1/text/object/{objectId}
+
+GET   /v1/speech
+GET   /v1/log
+GET   /v1/events
+
+GET   /v1/addons
+GET   /v1/global-plugins
+GET   /v1/drivers
+GET   /v1/diagnostics
+
+GET   /v1/settings/categories
+GET   /v1/settings/general
+PATCH /v1/settings/general
+
+GET   /v1/speech-dictionaries
+GET   /v1/speech-dictionaries/{default|voice|temp}
+POST  /v1/speech-dictionaries/{id}/validate
+PUT   /v1/speech-dictionaries/{id}
+
+GET   /v1/symbol-dictionaries/{locale|current}
+PUT   /v1/symbol-dictionaries/{locale}
+
+GET   /v1/gestures
+PATCH /v1/gestures
+
+POST  /v1/actions/{action}
+POST  /v1/lifecycle/restart
 ```
 
-`null` 表示不设置用户级限制，但循环检测、紧急节点/深度/子项上限、文件配额、最长运行时间和 TTL 仍然生效。单任务最多 100 MiB，全部保留结果合计最多 200 MiB、最多 8 个；创建频率限制为每分钟 10 次。完成文件保留到 TTL 或显式 `DELETE`，下载不会立即删除文件。
+Tree exports, diagnostic exports, and full backups use asynchronous job endpoints. Query `/v1/capabilities` for their exact paths and current quotas.
 
-## 异步完整 NVDA 备份
-
-备份任务调用 NVDA 自身的便携版创建实现，并包含当前用户配置。所有接口都要求 token：
+## Runtime status and modes
 
 ```text
-POST   /v1/backups
-GET    /v1/backups/{jobId}
-DELETE /v1/backups/{jobId}
+GET   /v1/status
+GET   /v1/modes
+PATCH /v1/modes
 ```
 
-`POST` 只接受 `{"targetPath":"D:\\backups"}`，并在目标文件夹中创建新的 `nvda` 子文件夹；目标文件夹可以已存在，也可由插件创建。若 `D:\\backups\\nvda` 已存在则拒绝覆盖。状态响应使用 `backupPath` 返回实际目录。删除或过期 HTTP 任务不会删除已完成的备份，备份中会移除 HTTP token 文件。
+`status` summarizes the current profile, application, synthesizer, braille display, and modes. Each mode reports whether it is `available` and `writable`. Currently, only input help, the current application's sleep mode, and the current document's browse mode are writable. Screen curtain is status-only.
 
-## 事件流
+Mode changes are session state and are not persisted by this endpoint. A PATCH must include the latest `baseRevision` returned by GET.
 
-SSE 事件流包含焦点、前台、名称、值、状态、插入点和语音事件。事件流属于敏感读取，始终要求 token。
+## Bounded text access
+
+```text
+GET  /v1/text/caret?maxChars=4096
+GET  /v1/text/selection?maxChars=4096
+GET  /v1/text/object/{objectId}?offset=0&maxChars=4096
+POST /v1/actions/set-caret
+POST /v1/actions/set-selection
+```
+
+Object text is paged in NVDA character units. The default page size is 4,096 characters and the per-request maximum is 32,768. Caret and selection mutations require the `objectId`, `generation`, and `revision` from a fresh read. If focus, document, or text state changes, the server returns `409 staleObject` or `staleState`; reacquire the object instead of retrying blindly.
+
+## Bounded accessibility trees
+
+Start with the safe defaults:
 
 ```powershell
-curl.exe -N http://127.0.0.1:19281/v1/events `
-  -H "Authorization: Bearer $($token.Trim())"
+python skill/scripts/nvda_http_bridge.py tree --root focus
 ```
 
-可使用 `?types=gainFocus,speech` 过滤；断线重连可以发送 `Last-Event-ID`。插件重载或缓冲溢出时会发送 `reset` 事件。
+Or request an explicitly bounded, flat result:
 
-## 动作
+```powershell
+python skill/scripts/nvda_http_bridge.py tree --root foreground `
+  --depth 6 --max-children 100 --max-nodes 800 --timeout-ms 2500 `
+  --format flat --include name,role,states,className
+```
 
-所有动作都要求 token：
+The response reports its generation, applied limits, node count, elapsed time, truncation state, and truncation reasons. Reasons can include `depthLimit`, `childLimit`, `nodeLimit`, `timeLimit`, `sizeLimit`, and `cycleDetected`.
+
+Version 1.4.0 defaults to depth 3, 20 children per parent, 200 nodes, and a 500 ms soft time budget. Synchronous hard limits are depth 10, 200 children per parent, 1,000 nodes, 3 seconds, and 2 MiB of JSON. Query live capabilities instead of hard-coding these values.
+
+If the requested scope exceeds synchronous limits, the server returns `422 exportRequired`. Use the asynchronous tree export workflow instead of splitting a large traversal into repeated synchronous calls:
+
+```powershell
+python skill/scripts/nvda_http_bridge.py export-run `
+  --root foreground --depth null --max-children null --max-nodes null `
+  --allow-unbounded --output .\tree.ndjson
+```
+
+Exports read NVDA objects in main-thread batches and stream NDJSON to a temporary file. Emergency depth, child, node, size, duration, retention, and aggregate-storage caps still apply.
+
+## Settings and dictionaries
+
+Configuration resources use NVDA's own backend objects and save paths:
+
+```powershell
+python skill/scripts/nvda_http_bridge.py settings-get
+python skill/scripts/nvda_http_bridge.py settings-set --body-file settings-change.json
+python skill/scripts/nvda_http_bridge.py speech-dictionary-get default
+python skill/scripts/nvda_http_bridge.py symbols-get current
+python skill/scripts/nvda_http_bridge.py gestures-get --filter time
+```
+
+Mutating requests must include the latest `baseRevision` from GET. Structured mutations use JSON body files. The server does not retry a mutation whose completion becomes uncertain. If a main-thread timeout happens after execution may have started, the response includes `completionUnknown=true`; the CLI reads the resource again and reports the observed state under `reconciliation`.
+
+General settings do not automatically save every NVDA configuration value, and a language change only reports that a restart is required. Clearing a non-empty speech dictionary as a whole and resetting all gestures are intentionally unsupported because their UI equivalents require confirmation.
+
+## Inventory and diagnostics
+
+The following endpoints are read-only:
+
+```text
+GET /v1/addons
+GET /v1/global-plugins
+GET /v1/drivers
+GET /v1/diagnostics
+```
+
+Diagnostic exports are asynchronous and accept only an empty JSON object. Each ZIP is capped at 5 MiB and contains structured inventories plus at most 2 MiB from the tail of the NVDA log. The caller cannot choose an arbitrary server-side file path. A secure-context change immediately revokes downloads and removes temporary results.
+
+## Events and controlled actions
+
+The SSE stream can report focus, foreground, name, value, state, caret, and speech events:
+
+```powershell
+python skill/scripts/nvda_http_bridge.py events --types gainFocus,speech --duration 5
+```
+
+It supports event-type filters and `Last-Event-ID` resumption. Plugin reloads and buffer overflows produce a `reset` event.
+
+Explicitly supported actions are:
 
 ```text
 POST /v1/actions/speak
@@ -162,28 +282,69 @@ POST /v1/actions/cancel-speech
 POST /v1/actions/gesture
 POST /v1/actions/focus
 POST /v1/actions/default-action
+POST /v1/actions/set-caret
+POST /v1/actions/set-selection
 ```
 
-示例：
+The gesture action resolves commands in NVDA's current focus context and does not pass an unhandled key through to the foreground application. A syntactically valid but currently unbound gesture returns `409 gestureNotBound`. Read focus and current gestures again before deciding what to do; do not automatically retry an action.
+
+The general action dispatcher rejects restart, quit, plugin reload, and equivalent lifecycle gestures. NVDA restart is available only through the dedicated lifecycle endpoint.
+
+## NVDA restart
+
+Use the synchronous client wrapper:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:19281/v1/actions/speak `
-  -Headers $headers -ContentType application/json -Body '{"text":"任务完成"}'
+python skill/scripts/nvda_http_bridge.py restart --wait-seconds 30
 ```
 
-HTTP 请求过程中触发插件重载可能造成生命周期互等，因此 `restart` 动作已明确禁用。
+`POST /v1/lifecycle/restart` accepts only `{}`. After completely returning `202 Accepted` and closing the request, it schedules NVDA's native `core.restart()` on the main thread. A `202` response alone does not prove completion. The client reports success only after `/health` shows a changed `nvdaProcessId` or `nvdaStartTime`; a lower Bridge uptime is not enough.
 
-## 验证
+For an older Bridge that does not advertise the lifecycle endpoint, the client can use an external `NVDA+Shift+Q` compatibility fallback. It never falls back after sending the dedicated POST, because a dropped connection at a process boundary has unknown completion state.
+
+## Full portable backup
+
+The backup workflow calls NVDA's own portable-copy implementation and includes the current user configuration:
+
+```powershell
+python skill/scripts/nvda_http_bridge.py backup --output D:\backups
+```
+
+The target is a parent directory. The Bridge creates a new `nvda` child and refuses to overwrite an existing one. Deleting or expiring the HTTP job does not delete a completed backup. A legacy `nvdaHttpBridge.token` file, if present from an older release, is excluded.
+
+## Security model
+
+- The server listens only on `127.0.0.1:19281` and rejects non-loopback `Host` values.
+- There is intentionally no token or client authentication. Any local process can call the API.
+- Never proxy, port-forward, or expose the Bridge to another machine or container network.
+- Cross-site browser `Origin` and `Sec-Fetch-Site` requests are rejected before entering the NVDA main thread.
+- Data and action requests are rejected on the lock screen and secure desktop. Sensitive caches and in-flight tree, diagnostic, and backup jobs are cleared or cancelled.
+- Tree traversal, text reads, response sizes, retained jobs, and main-thread work are bounded.
+- Individual UIA or IA2 property calls cannot be safely interrupted; budgets are checked before calls and between batches, so time limits are not hard real-time guarantees.
+- Object IDs, generations, revisions, and text offsets are short-lived. Mutations require fresh state.
+- The API does not provide arbitrary Python execution, imports, or general file access.
+
+Because `auth.mode=none`, untrusted local processes are outside the threat model. The protection boundary is the loopback listener, Host and browser-origin checks, secure-context enforcement, strict schemas, and resource limits. Legacy `%APPDATA%\nvda\nvdaHttpBridge.token` files are neither read nor created.
+
+## Development and verification
+
+Run the unit tests and compile the plugin sources:
 
 ```powershell
 python -m unittest discover -s tests -v
 python -m compileall nvda-addon/globalPlugins
 ```
 
-实机验证至少覆盖 NVDA 2025.3.3，以及 Win32、UIA、Chromium/IA2、锁屏、安全桌面、插件连续重载、导出取消、完整备份和对象失效场景。
+After activating changed runtime sources, verify at minimum that `/health`, `/v1/version`, and `/v1/capabilities` return HTTP 200 and that the running version matches the repository. Confirm that capabilities report `auth.mode=none`, then use bounded, non-mutating checks for the features involved in the change. Inspect the NVDA log for related import, initialization, and runtime errors.
 
-## 主线程超时排查
+Real-machine coverage should include supported NVDA versions and representative Win32, UIA, and Chromium/IA2 applications, as well as lock screen, secure desktop, repeated plugin reload, cancellation, backup, and stale-object cases.
 
-如果 `/health` 仍能响应，但对象、树和 `cancel-speech` 都返回 `504 mainThreadTimeout`，应先查看 NVDA 日志中的主线程冻结栈。若栈停在 `winAPI.sessionTracking` 调用 `WTSCurrentSessionInfoEx`，问题发生在 NVDA/Windows 会话状态查询，不是树遍历或 HTTP JSON 编码。
+## Troubleshooting main-thread timeouts
 
-在本次验证主机上，`TermService` 为停止状态时启动 NVDA 会触发该冻结；临时启动 Remote Desktop Services 后再启动 NVDA即可完成 WTS 初始化。初始化成功后把服务恢复为原来的停止/Manual 状态，NVDA 仍持续可用。这个结论是针对该主机的故障排查结果，不是插件的运行依赖；操作 Windows 服务需要管理员权限，也不应擅自改变服务启动类型。
+If `/health` responds but object, tree, and cancel-speech requests all return `504 mainThreadTimeout`, inspect the frozen main-thread stack in the NVDA log before increasing any timeout.
+
+If the stack is blocked in `winAPI.sessionTracking` at `WTSCurrentSessionInfoEx`, the problem is in NVDA/Windows session-state initialization rather than tree traversal or HTTP JSON encoding. On one development machine, starting NVDA while Remote Desktop Services (`TermService`) was stopped triggered this freeze. Temporarily starting the service before NVDA allowed initialization to complete; the service could then be restored to its previous state. This is a machine-specific diagnostic finding, not a Bridge dependency. Changing Windows services requires administrator privileges and should not be automated without explicit approval.
+
+## Project status
+
+NVDA HTTP Bridge is currently focused on local development, diagnostics, and agent-assisted accessibility workflows. Its API is versioned, but consumers should still use live capability discovery because fields, optional endpoints, and safety limits may evolve.

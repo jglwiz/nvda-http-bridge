@@ -40,7 +40,7 @@
 curl.exe http://127.0.0.1:19281/v1/version
 curl.exe http://127.0.0.1:19281/v1/capabilities
 curl.exe http://127.0.0.1:19281/v1/objects/focus</code></pre>
-  <p>写操作以及语音、日志、事件、导出和备份等敏感接口必须发送 <code>Authorization: Bearer &lt;token&gt;</code>。token 位于 <code>%APPDATA%\nvda\nvdaHttpBridge.token</code>，不得放进 URL。</p>
+  <p>所有接口都不要求凭据。服务只接受本机回环连接并检查 Host、浏览器来源和安全桌面状态；任何本机进程都能调用接口，请勿代理、转发或暴露该端口。</p>
 
   <h2>接口</h2>
   <table>
@@ -54,9 +54,14 @@ curl.exe http://127.0.0.1:19281/v1/objects/focus</code></pre>
       <tr><td><span class="method">GET</span></td><td><code>/v1/tree</code></td><td>有界可访问性树</td></tr>
       <tr><td><span class="method">GET</span></td><td><code>/v1/speech</code>、<code>/v1/log</code></td><td>敏感历史</td></tr>
       <tr><td><span class="method">GET</span></td><td><code>/v1/events</code></td><td>SSE 事件流</td></tr>
+      <tr><td><span class="method">GET/PATCH</span></td><td><code>/v1/modes</code></td><td>读取或修改当前上下文模式</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/text/{caret|selection}</code></td><td>读取有界文本范围</td></tr>
+      <tr><td><span class="method">GET</span></td><td><code>/v1/{addons|global-plugins|drivers|diagnostics}</code></td><td>只读运行清单与诊断</td></tr>
       <tr><td><span class="method">POST</span></td><td><code>/v1/tree/exports</code></td><td>创建异步 NDJSON 树导出</td></tr>
       <tr><td><span class="method">POST</span></td><td><code>/v1/backups</code></td><td>创建异步便携版备份</td></tr>
+      <tr><td><span class="method">POST</span></td><td><code>/v1/diagnostics/exports</code></td><td>创建有界诊断 ZIP</td></tr>
       <tr><td><span class="method">POST</span></td><td><code>/v1/actions/{action}</code></td><td>执行白名单动作</td></tr>
+      <tr><td><span class="method">POST</span></td><td><code>/v1/lifecycle/restart</code></td><td>响应完成后调度 NVDA 原生进程重启</td></tr>
     </tbody>
   </table>
 
@@ -66,26 +71,26 @@ curl.exe http://127.0.0.1:19281/v1/objects/focus</code></pre>
   <p>超过同步上限时使用 <code>POST /v1/tree/exports</code>。通过 <code>GET /v1/tree/exports/{jobId}</code> 查询状态，<code>GET /v1/tree/exports/{jobId}/data</code> 下载，<code>DELETE /v1/tree/exports/{jobId}</code> 取消或清理。</p>
 
   <h2>备份</h2>
-  <p><code>POST /v1/backups</code> 的请求体必须且只能包含 <code>{"targetPath":"D:\\backups"}</code>。插件创建 <code>D:\backups\nvda</code>，拒绝覆盖现有目录，并从结果中移除 HTTP token。状态响应以 <code>backupPath</code> 返回实际目录。</p>
+  <p><code>POST /v1/backups</code> 的请求体必须且只能包含 <code>{"targetPath":"D:\\backups"}</code>。插件创建 <code>D:\backups\nvda</code>，拒绝覆盖现有目录，并排除旧版本遗留的凭据文件。状态响应以 <code>backupPath</code> 返回实际目录。</p>
   <pre><code>POST   /v1/backups
 GET    /v1/backups/{jobId}
 DELETE /v1/backups/{jobId}</code></pre>
   <p>删除或过期任务只清理任务状态，不删除已完成的备份。</p>
 
   <h2>动作</h2>
-  <p>动作名只接受 <code>speak</code>、<code>cancel-speech</code>、<code>gesture</code>、<code>focus</code> 和 <code>default-action</code>。HTTP 内不提供重启；重启测试必须由外部客户端发送明确配置的 NVDA 快捷键并核对新的运行时间。</p>
+  <p>动作名只接受 <code>speak</code>、<code>cancel-speech</code>、<code>gesture</code>、<code>focus</code>、<code>default-action</code>、<code>set-caret</code> 和 <code>set-selection</code>，通用动作和 gesture 均不能触发生命周期操作。明确授权的重启使用专用 <code>POST /v1/lifecycle/restart</code>；原始 HTTP 返回 <code>202</code> 后才调度重启，CLI 通过 PID/启动时间变化确认完成。</p>
   <pre><code>Invoke-RestMethod -Method Post `
   -Uri http://127.0.0.1:19281/v1/actions/speak `
-  -Headers $headers -ContentType application/json `
+  -ContentType application/json `
   -Body '{"text":"任务完成"}'</code></pre>
 
   <h2>构建与验证</h2>
   <pre><code>.\build.ps1
 python -m unittest discover -s tests -v
 python -m compileall nvda-addon/globalPlugins</code></pre>
-  <p>默认产物为 <code>dist/nvdaHttpBridge-1.0.0.nvda-addon</code>。</p>
+  <p>默认产物为 <code>dist/nvdaHttpBridge-1.4.0.nvda-addon</code>。</p>
 
-  <footer>NVDA HTTP Bridge · 1.0.0</footer>
+  <footer>NVDA HTTP Bridge · 1.4.0</footer>
 </main>
 </body>
 </html>

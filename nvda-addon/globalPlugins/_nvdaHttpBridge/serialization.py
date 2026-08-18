@@ -7,7 +7,7 @@ import time
 
 from .config import ALLOWED_FIELDS, MAX_OBJECT_TEXT, OBJECT_REGISTRY_CAPACITY, OBJECT_TTL_SECONDS
 from .errors import StaleObject
-from .ids import token_urlsafe
+from .ids import random_urlsafe
 
 
 def safe_text(value, limit=MAX_OBJECT_TEXT):
@@ -78,7 +78,7 @@ class ObjectRegistry:
 		self._lock = threading.RLock()
 
 	def new_generation(self):
-		return token_urlsafe(9)
+		return random_urlsafe(9)
 
 	def register(self, obj, generation):
 		now = self._monotonic()
@@ -95,7 +95,7 @@ class ObjectRegistry:
 					entry.expires_at = now + self._ttl
 					self._entries.move_to_end(existing_id)
 					return existing_id
-			object_id = "%s.%s" % (generation, token_urlsafe(12))
+			object_id = "%s.%s" % (generation, random_urlsafe(12))
 			self._entries[object_id] = _RegistryEntry(obj, generation, now + self._ttl)
 			self._by_identity[identity_key] = object_id
 			self._evict(now)

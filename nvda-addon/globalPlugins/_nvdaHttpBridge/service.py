@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 
 from .auth import RateLimiter
 from .config import (
@@ -22,6 +23,12 @@ from .config import (
 	DEFAULT_TREE_DEPTH,
 	DEFAULT_TREE_NODES,
 	DEFAULT_TREE_TIMEOUT_MS,
+	DIAGNOSTICS_CREATE_RATE_LIMIT,
+	DIAGNOSTICS_CREATE_RATE_WINDOW_SECONDS,
+	DIAGNOSTICS_MAX_BYTES,
+	DIAGNOSTICS_MAX_CONCURRENT,
+	DIAGNOSTICS_MAX_RETAINED_JOBS,
+	DIAGNOSTICS_TTL_SECONDS,
 	EXPORT_CREATE_RATE_LIMIT,
 	EXPORT_CREATE_RATE_WINDOW_SECONDS,
 	EXPORT_MAX_BYTES,
@@ -43,7 +50,6 @@ from .config import (
 	PLUGIN_VERSION,
 	PORT,
 	PROTOCOL_VERSION,
-	REQUIRE_READ_TOKEN,
 	ROOT_NAMES,
 	SYNC_BATCH_BUDGET_MS,
 	SYNC_BATCH_NODES,
@@ -57,6 +63,7 @@ from .config import (
 from .errors import (
 	BadRequest,
 	NotFound,
+	RestartAlreadyScheduled,
 	SecureContext,
 	TooManyRequests,
 	UnsafeAction,
@@ -75,10 +82,18 @@ class BridgeService:
 		events,
 		speech_observer,
 		exports,
-		tokens,
 		security_state,
 		backups=None,
+		settings=None,
+		status=None,
+		text=None,
+		diagnostics=None,
+		diagnostic_exports=None,
+		speech_dictionaries=None,
+		symbol_dictionaries=None,
+		gestures=None,
 		monotonic=None,
+		logger=None,
 	):
 		self.adapter = adapter
 		self.executor = executor
@@ -86,10 +101,18 @@ class BridgeService:
 		self.events = events
 		self.speech_observer = speech_observer
 		self.exports = exports
-		self.tokens = tokens
 		self.security_state = security_state
 		self.backups = backups
+		self.settings = settings
+		self.status_adapter = status
+		self.text_adapter = text
+		self.diagnostics_adapter = diagnostics
+		self.diagnostic_exports = diagnostic_exports
+		self.speech_dictionaries = speech_dictionaries
+		self.symbol_dictionaries = symbol_dictionaries
+		self.gestures = gestures
 		self._monotonic = monotonic or time.monotonic
+		self._logger = logger
 		self._started_at = self._monotonic()
 		self._closing = False
 		self._closed = False
@@ -104,12 +127,16 @@ class BridgeService:
 			window_seconds=BACKUP_CREATE_RATE_WINDOW_SECONDS,
 			monotonic=self._monotonic,
 		)
+		self._diagnostics_rate_limiter = RateLimiter(
+			limit=DIAGNOSTICS_CREATE_RATE_LIMIT,
+			window_seconds=DIAGNOSTICS_CREATE_RATE_WINDOW_SECONDS,
+			monotonic=self._monotonic,
+		)
 		self._tree_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SYNC_TREES)
+		self._restart_lock = threading.Lock()
+		self._pending_restart = None
+		self._restart_dispatched = False
 		self._event_generation = self.registry.new_generation()
-
-	def authorize(self, token, write=False, sensitive=False):
-		if write or sensitive or REQUIRE_READ_TOKEN:
-			self.tokens.authorize(token)
 
 	def assert_data_available(self):
 		if self._closing:
@@ -130,24 +157,34 @@ class BridgeService:
 		else:
 			main_thread_state = "unknown"
 		status = "closing" if self._closing else ("degraded" if main_thread_state == "unavailable" else "ok")
+		identity = self.adapter.nvda_identity()
+		with self._restart_lock:
+			restart_pending = self._pending_restart is not None
 		return {
 			"status": status,
 			"protocolVersion": PROTOCOL_VERSION,
 			"pluginVersion": PLUGIN_VERSION,
 			"uptimeMs": round((self._monotonic() - self._started_at) * 1000, 2),
+			"nvdaProcessId": identity["nvdaProcessId"],
+			"nvdaStartTime": identity["nvdaStartTime"],
+			"restartPending": restart_pending,
 			"security": self.security_state.snapshot(),
 			"mainThread": {"state": main_thread_state},
 			"executor": executor_metrics,
 			"exports": self.exports.metrics(),
 			"backups": self.backups.metrics() if self.backups is not None else None,
+			"diagnosticExports": self.diagnostic_exports.metrics() if self.diagnostic_exports is not None else None,
 			"objectRegistrySize": self.registry.size(),
 		}
 
 	def version(self):
+		identity = self.adapter.nvda_identity()
 		return {
 			"plugin": {"name": "nvdaHttpBridge", "version": PLUGIN_VERSION},
 			"protocolVersion": PROTOCOL_VERSION,
 			"nvda": self.adapter.version(),
+			"nvdaProcessId": identity["nvdaProcessId"],
+			"nvdaStartTime": identity["nvdaStartTime"],
 			"python": sys.version.split()[0],
 		}
 
@@ -155,12 +192,7 @@ class BridgeService:
 		return {
 			"protocolVersion": PROTOCOL_VERSION,
 			"listen": {"host": HOST, "port": PORT, "loopbackOnly": True},
-			"auth": {
-				"readTokenRequired": REQUIRE_READ_TOKEN,
-				"writeTokenRequired": True,
-				"sensitiveReadTokenRequired": True,
-				"tokenFile": os.path.basename(self.tokens.path),
-			},
+			"auth": {"mode": "none"},
 			"roots": list(ROOT_NAMES),
 			"fields": list(ALLOWED_FIELDS),
 			"treeFormats": list(TREE_FORMATS),
@@ -210,17 +242,137 @@ class BridgeService:
 				"jobStatusRetentionSeconds": BACKUP_TTL_SECONDS,
 				"completedBackupPreserved": True,
 			},
+			"textLimits": self.text_adapter.limits() if self.text_adapter is not None else None,
+			"diagnosticExportLimits": {
+				"maxConcurrent": DIAGNOSTICS_MAX_CONCURRENT,
+				"maxBytes": DIAGNOSTICS_MAX_BYTES,
+				"maxRetainedJobs": DIAGNOSTICS_MAX_RETAINED_JOBS,
+				"createRateLimit": DIAGNOSTICS_CREATE_RATE_LIMIT,
+				"createRateWindowSeconds": DIAGNOSTICS_CREATE_RATE_WINDOW_SECONDS,
+				"retentionSeconds": DIAGNOSTICS_TTL_SECONDS,
+			},
 			"endpoints": {
+				"status": "/v1/status",
+				"modes": "/v1/modes",
 				"focus": "/v1/objects/focus",
 				"objectById": "/v1/objects/by-id/{objectId}",
 				"tree": "/v1/tree",
 				"treeExports": "/v1/tree/exports",
 				"backups": "/v1/backups",
+				"textCaret": "/v1/text/caret",
+				"textSelection": "/v1/text/selection",
+				"textObject": "/v1/text/object/{objectId}",
+				"addons": "/v1/addons",
+				"globalPlugins": "/v1/global-plugins",
+				"drivers": "/v1/drivers",
+				"diagnostics": "/v1/diagnostics",
+				"diagnosticExports": "/v1/diagnostics/exports",
 				"events": "/v1/events",
+				"settings": "/v1/settings/general",
+				"speechDictionaries": "/v1/speech-dictionaries",
+				"symbolDictionaries": "/v1/symbol-dictionaries/{locale}",
+				"gestures": "/v1/gestures",
+				"lifecycleRestart": "/v1/lifecycle/restart",
 			},
-			"actions": ["speak", "cancel-speech", "gesture", "focus", "default-action"],
+			"lifecycle": {
+				"restart": {
+					"endpoint": "/v1/lifecycle/restart",
+					"execution": "processBoundaryAsync",
+					"responseStatus": 202,
+					"requestBody": "emptyObject",
+					"verification": "nvdaProcessIdentity",
+					"legacyFallback": "externalNvdaShiftQWhenCapabilityAbsent",
+				},
+			},
+			"configurationResources": {
+				"modes": {
+					"execution": "synchronous",
+					"writableFields": ["inputHelp", "sleepMode", "browseMode"],
+					"readOnlyFields": ["screenCurtain"],
+					"persistedByEndpoint": False,
+				},
+				"settings/general": {
+					"execution": "synchronous",
+					"fields": [
+						"language", "saveConfigurationOnExit", "askToExit",
+						"playStartAndExitSounds", "preventDisplayTurningOff",
+					],
+					"persistedByEndpoint": False,
+					"restartFields": ["language"],
+				},
+				"speechDictionaries": {
+					"execution": "synchronous",
+					"ids": ["default", "voice", "temp"],
+					"clearAllSupported": False,
+				},
+				"symbolDictionaries": {
+					"execution": "synchronous",
+					"actions": ["add", "edit", "removeUserOverride"],
+				},
+				"gestures": {
+					"execution": "synchronous",
+					"actions": ["add", "remove", "unbind", "addKbEmulation"],
+					"resetAllSupported": False,
+				},
+			},
+			"actions": [
+				"speak", "cancel-speech", "gesture", "focus", "default-action",
+				"set-caret", "set-selection",
+			],
 			"eventTypes": ["gainFocus", "foreground", "nameChange", "valueChange", "stateChange", "caret", "speech"],
 		}
+
+	def _configuration_call(self, adapter, method_name, *args, timeout_ms=3000):
+		self.assert_data_available()
+		if adapter is None:
+			from .errors import ServiceUnavailable
+
+			raise ServiceUnavailable("The requested configuration resource is unavailable")
+		return self.executor.call(lambda: getattr(adapter, method_name)(*args), timeout_ms)
+
+	def settings_categories(self):
+		return self._configuration_call(self.settings, "categories")
+
+	def runtime_status(self):
+		return self._configuration_call(self.status_adapter, "get_status")
+
+	def modes(self):
+		return self._configuration_call(self.status_adapter, "get_modes")
+
+	def patch_modes(self, body):
+		return self._configuration_call(self.status_adapter, "patch_modes", body)
+
+	def general_settings(self):
+		return self._configuration_call(self.settings, "get_general")
+
+	def patch_general_settings(self, body):
+		return self._configuration_call(self.settings, "patch_general", body)
+
+	def speech_dictionary_list(self):
+		return self._configuration_call(self.speech_dictionaries, "list")
+
+	def speech_dictionary(self, dictionary_id):
+		return self._configuration_call(self.speech_dictionaries, "get", dictionary_id)
+
+	def validate_speech_dictionary(self, dictionary_id, body):
+		return self._configuration_call(self.speech_dictionaries, "validate", dictionary_id, body)
+
+	def put_speech_dictionary(self, dictionary_id, body):
+		return self._configuration_call(self.speech_dictionaries, "put", dictionary_id, body)
+
+	def symbol_dictionary(self, locale):
+		return self._configuration_call(self.symbol_dictionaries, "get", locale)
+
+	def put_symbol_dictionary(self, locale, body):
+		return self._configuration_call(self.symbol_dictionaries, "put", locale, body)
+
+	def gesture_mappings(self, context="current", filter_text=None):
+		if context != "current":
+			raise ValidationError("Only context=current is supported")
+		return self._configuration_call(self.gestures, "get", filter_text)
+
+	def patch_gestures(self, body):
+		return self._configuration_call(self.gestures, "patch", body)
 
 	def object_snapshot(self, root_name, params=None):
 		self.assert_data_available()
@@ -247,6 +399,55 @@ class BridgeService:
 			return serialize_object(obj, include, self.registry, generation, self.adapter)
 
 		return self.executor.call(work, 1000)
+
+	def current_text(self, position, params=None):
+		self.assert_data_available()
+		if self.text_adapter is None:
+			from .errors import ServiceUnavailable
+
+			raise ServiceUnavailable("Text support is unavailable")
+		offset, max_chars = self.text_adapter.parse_window(params)
+		if offset:
+			raise ValidationError("offset is only supported for object text")
+
+		def work():
+			self.adapter.assert_safe()
+			obj = self.text_adapter.backend.caret_object()
+			self.adapter.assert_safe(obj)
+			generation = self.registry.new_generation()
+			object_id = self.registry.register(obj, generation)
+			return self.text_adapter.current(position, obj, object_id, generation, max_chars)
+
+		return self.executor.call(work, 1000)
+
+	def object_text(self, object_id, params=None):
+		self.assert_data_available()
+		if self.text_adapter is None:
+			from .errors import ServiceUnavailable
+
+			raise ServiceUnavailable("Text support is unavailable")
+		offset, max_chars = self.text_adapter.parse_window(params)
+
+		def work():
+			obj, generation = self.registry.resolve(object_id)
+			self.adapter.assert_safe(obj)
+			return self.text_adapter.object_text(obj, object_id, generation, offset, max_chars)
+
+		return self.executor.call(work, 3000)
+
+	def addons(self):
+		return self._configuration_call(self.diagnostics_adapter, "addons", timeout_ms=5000)
+
+	def global_plugins(self):
+		return self._configuration_call(self.diagnostics_adapter, "global_plugins", timeout_ms=5000)
+
+	def drivers(self):
+		return self._configuration_call(self.diagnostics_adapter, "drivers", timeout_ms=5000)
+
+	def diagnostics(self):
+		result = self._configuration_call(self.diagnostics_adapter, "snapshot", timeout_ms=5000)
+		result["bridge"] = self.health()
+		return result
 
 	@staticmethod
 	def _object_fields(params):
@@ -392,6 +593,79 @@ class BridgeService:
 	def cancel_backup(self, job_id):
 		return self.backups.cancel(job_id)
 
+	def create_diagnostic_export(self, body):
+		self.assert_data_available()
+		if not isinstance(body, dict):
+			raise BadRequest("The diagnostic export body must be a JSON object")
+		if body:
+			raise ValidationError("The diagnostic export body must be an empty object")
+		if self.diagnostic_exports is None:
+			from .errors import ServiceUnavailable
+
+			raise ServiceUnavailable("Diagnostic export support is unavailable")
+		self._diagnostics_rate_limiter.check("create")
+		return self.diagnostic_exports.create()
+
+	def diagnostic_export_status(self, job_id):
+		return self.diagnostic_exports.status(job_id)
+
+	def open_diagnostic_export_data(self, job_id):
+		self.assert_data_available()
+		return self.diagnostic_exports.open_data(job_id)
+
+	def diagnostic_export_download_allowed(self, job_id):
+		return (
+			not self._closing
+			and not self.security_state.restricted()
+			and self.diagnostic_exports.is_downloadable(job_id)
+		)
+
+	def cancel_diagnostic_export(self, job_id):
+		return self.diagnostic_exports.cancel(job_id)
+
+	def prepare_restart(self, body):
+		self.assert_data_available()
+		if not isinstance(body, dict):
+			raise ValidationError("The restart body must be an empty JSON object")
+		if body:
+			raise ValidationError("The restart body must be an empty JSON object", details={"unknown": sorted(body)})
+		self._rate_limiter.check("restart")
+		self.executor.call(self.adapter.assert_restart_allowed, 1000)
+		identity = self.adapter.nvda_identity()
+		before = {
+			"nvdaProcessId": identity["nvdaProcessId"],
+			"nvdaStartTime": identity["nvdaStartTime"],
+			"bridgeUptimeMs": round((self._monotonic() - self._started_at) * 1000, 2),
+		}
+		restart_id = uuid.uuid4().hex
+		with self._restart_lock:
+			if self._pending_restart is not None:
+				raise RestartAlreadyScheduled()
+			self._pending_restart = restart_id
+		return {"status": "accepted", "restartId": restart_id, "before": before}
+
+	def schedule_prepared_restart(self, restart_id):
+		with self._restart_lock:
+			if self._pending_restart != restart_id or self._restart_dispatched:
+				return False
+			self._restart_dispatched = True
+			# Keep the reservation set until this process exits. A second request must
+			# never schedule another lifecycle action if shutdown is slow or fails.
+		def restart_work():
+			try:
+				self.adapter.restart()
+			except Exception:
+				if self._logger is not None:
+					self._logger.exception(
+						"nvdaHttpBridge: native restart failed restartId=%s",
+						restart_id,
+					)
+				else:
+					raise
+
+		self.adapter.schedule(restart_work)
+		return True
+
 	def action(self, action_name, body):
 		self.assert_data_available()
 		if not isinstance(body, dict):
@@ -416,6 +690,26 @@ class BridgeService:
 				raise ValidationError("A non-empty 'key' value is required")
 			self._validate_gesture(key)
 			return self._main_action(lambda: self.adapter.execute_gesture(key), {"ok": True, "key": key})
+		if action_name in ("set-caret", "set-selection"):
+			if self.text_adapter is None:
+				from .errors import ServiceUnavailable
+
+				raise ServiceUnavailable("Text support is unavailable")
+			object_id = body.get("objectId")
+			generation = body.get("generation")
+			if not isinstance(object_id, str) or not object_id:
+				raise ValidationError("An 'objectId' value is required")
+			if not isinstance(generation, str) or not generation:
+				raise ValidationError("A 'generation' value is required")
+
+			def text_action():
+				obj, resolved_generation = self.registry.resolve(object_id, generation)
+				self.adapter.assert_safe(obj)
+				if action_name == "set-caret":
+					return self.text_adapter.set_caret(obj, object_id, resolved_generation, body)
+				return self.text_adapter.set_selection(obj, object_id, resolved_generation, body)
+
+			return self.executor.call(text_action, 3000)
 		if action_name in ("focus", "default-action"):
 			self._validate_keys(body, {"objectId"}, optional={"generation"})
 			object_id = body.get("objectId")
@@ -460,9 +754,9 @@ class BridgeService:
 		elif normalized.startswith("kb(") and "):" in normalized:
 			normalized = normalized.split("):", 1)[1]
 		aliases = {"ctrl": "control", "capslock": "nvda", "insert": "nvda", "numpadinsert": "nvda"}
-		tokens = {aliases.get(token, token) for token in normalized.split("+") if token}
+		parts = {aliases.get(part, part) for part in normalized.split("+") if part}
 		for blocked in BLOCKED_GESTURE_CHORDS:
-			if set(blocked).issubset(tokens):
+			if set(blocked).issubset(parts):
 				raise UnsafeAction("This gesture can reload or terminate NVDA")
 
 	def capture_event(self, event_type, obj):
@@ -496,6 +790,8 @@ class BridgeService:
 		self.exports.cancel_sensitive()
 		if self.backups is not None:
 			self.backups.cancel_sensitive()
+		if self.diagnostic_exports is not None:
+			self.diagnostic_exports.cancel_sensitive()
 
 	def begin_close(self):
 		if self._closing:
@@ -505,6 +801,8 @@ class BridgeService:
 		self.exports.cancel_sensitive()
 		if self.backups is not None:
 			self.backups.cancel_sensitive()
+		if self.diagnostic_exports is not None:
+			self.diagnostic_exports.cancel_sensitive()
 		self.speech_observer.set_enabled(False, clear=True)
 		self.events.close()
 
@@ -515,6 +813,8 @@ class BridgeService:
 		self.exports.close()
 		if self.backups is not None:
 			self.backups.close()
+		if self.diagnostic_exports is not None:
+			self.diagnostic_exports.close()
 		self.registry.clear()
 		self.speech_observer.set_enabled(False, clear=True)
 		self.events.close()

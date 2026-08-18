@@ -24,12 +24,6 @@ class BadRequest(BridgeError):
 	default_message = "The request is invalid"
 
 
-class Unauthorized(BridgeError):
-	status = 401
-	code = "unauthorized"
-	default_message = "A valid local session token is required"
-
-
 class Forbidden(BridgeError):
 	status = 403
 	code = "forbidden"
@@ -52,6 +46,27 @@ class Conflict(BridgeError):
 	status = 409
 	code = "conflict"
 	default_message = "The request conflicts with the current bridge state"
+
+
+class StaleState(Conflict):
+	code = "staleState"
+	default_message = "The resource changed since it was read"
+
+
+class RestartBlocked(Conflict):
+	code = "restartBlocked"
+	default_message = "NVDA cannot be safely restarted in the current UI state"
+
+
+class RestartAlreadyScheduled(Conflict):
+	code = "restartAlreadyScheduled"
+	default_message = "An NVDA restart is already scheduled"
+
+
+class PartialFailure(BridgeError):
+	status = 500
+	code = "partialFailure"
+	default_message = "The operation failed and persistence could not be proven atomic"
 
 
 class ValidationError(BridgeError):
@@ -91,3 +106,8 @@ class SecureContext(Forbidden):
 class UnsafeAction(Conflict):
 	code = "unsafeAction"
 	default_message = "This action is intentionally unavailable over HTTP"
+
+
+class GestureNotBound(Conflict):
+	code = "gestureNotBound"
+	default_message = "The gesture is not bound in the current NVDA context"

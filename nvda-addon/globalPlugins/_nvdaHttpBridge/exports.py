@@ -24,7 +24,7 @@ from .config import (
 	EXPORT_TTL_SECONDS,
 )
 from .errors import Conflict, NotFound, SecureContext, ServiceUnavailable, TooManyRequests
-from .ids import token_urlsafe
+from .ids import random_urlsafe
 from .tree import TreeWalker
 
 
@@ -147,7 +147,7 @@ class ExportManager:
 			if sum(job.byte_count for job in retained) >= EXPORT_MAX_TOTAL_BYTES:
 				raise TooManyRequests("The total export storage quota was reached")
 			os.makedirs(self._export_root, exist_ok=True)
-			job_id = token_urlsafe(18)
+			job_id = random_urlsafe(18)
 			part_path = os.path.join(self._export_root, job_id + ".part")
 			data_path = os.path.join(self._export_root, job_id + ".ndjson")
 			job = ExportJob(
