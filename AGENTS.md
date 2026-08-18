@@ -1,16 +1,17 @@
-# NVDA restart workflow
+# NVDA local testing
 
-To restart NVDA during local testing:
+Scratchpad deployment and every NVDA restart required to activate or validate in-scope local Bridge changes are pre-authorized. Do not request separate confirmation. This authorization does not cover unrelated operating-system changes.
 
-1. Require an explicit user request or an agreed restart test.
-2. Prefer the bridge's dedicated restart API when it is available. A restart request must be explicitly authorized by the user, must be scheduled so the initiating HTTP response can complete before NVDA shuts down, and must not be implemented by routing a lifecycle gesture through the generic `gesture` action.
+## Restart
 
-   When the dedicated API is unavailable, use the bundled `skill` client's external restart workflow. In the current setup, Caps Lock is the NVDA modifier:
+1. Use the bundled client, which prefers the dedicated lifecycle API and falls back to the external `NVDA+Shift+Q` workflow. Caps Lock is the NVDA modifier:
 
    ```powershell
    python skill/scripts/nvda_http_bridge.py restart --nvda-key capslock --wait-seconds 30
    ```
 
-3. Treat either restart workflow as successful only after the client observes a changed NVDA process ID or process start time. A lower Bridge `uptimeMs` is supporting evidence only; an accepted HTTP response or successful hotkey delivery alone is not proof of restart.
+2. The dedicated endpoint must remain loopback-only, enforce Host/browser-origin and secure-context checks, complete its HTTP response before shutdown, and call NVDA's lifecycle backend. The generic `gesture` action may send NVDA's native restart gesture; this permission does not cover arbitrary gestures.
+3. Treat restart as successful only after observing a changed `nvdaProcessId` or `nvdaStartTime`. An accepted response, successful hotkey delivery, or lower Bridge uptime is not sufficient.
+4. After activating changed Bridge sources, run the repository's relevant non-mutating post-restart checks and inspect the NVDA log for related import, initialization, and runtime errors.
 
-The external workflow sends the custom `NVDA+Shift+Q` shortcut from the client process and polls NVDA HTTP Bridge health. A dedicated HTTP restart endpoint is permitted when it remains loopback-only, enforces Host/browser-origin and secure-context checks, completes its response before shutdown handoff, and verifies a new process identity. The Bridge intentionally has no token authentication, so any local process can call it. Never trigger restart through the bridge's generic `gesture` action.
+The Bridge intentionally uses `auth.mode=none`; browser and remote-network restrictions remain required, while untrusted local processes are outside this threat model.
