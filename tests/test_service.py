@@ -10,6 +10,7 @@ from _nvdaHttpBridge.errors import (
 	RestartAlreadyScheduled,
 	RestartBlocked,
 	StaleObject,
+	TextPositionUnavailable,
 	UnsafeAction,
 	ValidationError,
 )
@@ -335,6 +336,31 @@ class BridgeServiceActionTests(unittest.TestCase):
 		self.assertEqual((1, 3), (selection["start"], selection["end"]))
 		with self.assertRaises(ValidationError):
 			self.service.action("set-caret", {"objectId": object_id, "offset": 2})
+
+	def test_current_text_propagates_structured_position_unavailable(self):
+		node = FakeNode("document")
+
+		class Backend:
+			@staticmethod
+			def caret_object():
+				return node
+
+		class CurrentTextAdapter:
+			backend = Backend()
+
+			@staticmethod
+			def parse_window(params):
+				return 0, 100
+
+			@staticmethod
+			def current(position, obj, object_id, generation, max_chars):
+				raise TextPositionUnavailable(details={"position": position})
+
+		self.service.text_adapter = CurrentTextAdapter()
+		with self.assertRaises(TextPositionUnavailable) as caught:
+			self.service.current_text("caret")
+
+		self.assertEqual({"position": "caret"}, caught.exception.details)
 
 	def test_diagnostic_export_accepts_only_empty_body_and_is_advertised(self):
 		manager = FakeDiagnosticExports()

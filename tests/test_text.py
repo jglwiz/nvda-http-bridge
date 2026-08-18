@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from support import GLOBAL_PLUGINS  # noqa: F401
 
-from _nvdaHttpBridge.errors import StaleState, ValidationError
+from _nvdaHttpBridge.errors import StaleState, TextPositionUnavailable, ValidationError
 from _nvdaHttpBridge.text import NvdaTextBackend, TextAdapter
 
 
@@ -138,7 +138,7 @@ class NvdaTextBackendTests(unittest.TestCase):
 		self.assertTrue(info.isCollapsed)
 		self.assertEqual(["selection", "caret"], obj.calls)
 
-	def test_caret_provider_errors_are_propagated_without_fallback(self):
+	def test_unsupported_caret_raises_structured_unavailable(self):
 		text_infos = types.ModuleType("textInfos")
 		text_infos.POSITION_CARET = "caret"
 		text_infos.POSITION_SELECTION = "selection"
@@ -152,13 +152,49 @@ class NvdaTextBackendTests(unittest.TestCase):
 				self.calls.append(position)
 				raise self.error
 
+		obj = Object(NotImplementedError("caret unsupported"))
 		with patch.dict(sys.modules, {"textInfos": text_infos}):
-			for error in (RuntimeError("caret failed"), NotImplementedError("caret unsupported")):
-				with self.subTest(error=type(error).__name__):
-					obj = Object(error)
-					with self.assertRaises(type(error)):
-						NvdaTextBackend().current_info(obj, "caret")
-					self.assertEqual(["caret"], obj.calls)
+			with self.assertRaises(TextPositionUnavailable) as caught:
+				NvdaTextBackend().current_info(obj, "caret")
+
+		self.assertEqual(409, caught.exception.status)
+		self.assertEqual("textPositionUnavailable", caught.exception.code)
+		self.assertEqual({"position": "caret"}, caught.exception.details)
+		self.assertEqual(["caret"], obj.calls)
+
+	def test_selection_without_caret_raises_structured_unavailable(self):
+		text_infos = types.ModuleType("textInfos")
+		text_infos.POSITION_CARET = "caret"
+		text_infos.POSITION_SELECTION = "selection"
+
+		class Object:
+			def __init__(self):
+				self.calls = []
+
+			def makeTextInfo(self, position):
+				self.calls.append(position)
+				raise NotImplementedError("text position unsupported")
+
+		obj = Object()
+		with patch.dict(sys.modules, {"textInfos": text_infos}):
+			with self.assertRaises(TextPositionUnavailable) as caught:
+				NvdaTextBackend().current_info(obj, "selection")
+
+		self.assertEqual({"position": "selection"}, caught.exception.details)
+		self.assertEqual(["selection", "caret"], obj.calls)
+
+	def test_caret_runtime_error_is_not_misreported_as_unavailable(self):
+		text_infos = types.ModuleType("textInfos")
+		text_infos.POSITION_CARET = "caret"
+		text_infos.POSITION_SELECTION = "selection"
+
+		class Object:
+			def makeTextInfo(self, position):
+				raise RuntimeError("caret failed")
+
+		with patch.dict(sys.modules, {"textInfos": text_infos}):
+			with self.assertRaisesRegex(RuntimeError, "caret failed"):
+				NvdaTextBackend().current_info(Object(), "caret")
 
 
 if __name__ == "__main__":

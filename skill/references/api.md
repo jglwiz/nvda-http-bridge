@@ -68,6 +68,7 @@ Diagnostic export creation accepts only `{}`. The ZIP is capped at 5 MiB and con
 | `403 secureContext` | Lock screen or secure desktop | Stop sensitive work |
 | `409 staleObject` | Object ID/generation expired | Re-read the current object |
 | `409 staleState` | A configuration revision or gesture UI context changed | GET the resource again and re-evaluate the intended change |
+| `409 textPositionUnavailable` | The current NVDA object has no caret or selection text position | Treat the text resource as unavailable until the current object changes |
 | `409 gestureNotBound` | The gesture has no script in the current focus context | Re-read focus and current-context gestures; do not retry automatically |
 | `409 unsafeAction` | Lifecycle or dangerous gesture denied | Do not work around it |
 | `409 restartBlocked` | NVDA modal state prevents a safe restart | Close the modal UI and make a new explicitly authorized request |

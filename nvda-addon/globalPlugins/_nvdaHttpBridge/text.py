@@ -1,7 +1,7 @@
 """Bounded text ranges and stale-safe caret/selection mutations."""
 
 from .config import DEFAULT_TEXT_CHARS, MAX_TEXT_CHARS, MAX_TEXT_OFFSET
-from .errors import Conflict, ValidationError
+from .errors import Conflict, TextPositionUnavailable, ValidationError
 from .resource_utils import reject_unknown, require_object, require_revision, revision
 from .serialization import safe_text
 
@@ -23,12 +23,17 @@ class NvdaTextBackend:
 		text_position = constants.POSITION_CARET if position == "caret" else constants.POSITION_SELECTION
 		try:
 			return obj.makeTextInfo(text_position)
-		except (NotImplementedError, RuntimeError):
+		except (NotImplementedError, RuntimeError) as error:
 			if position != "selection":
+				if isinstance(error, NotImplementedError):
+					raise TextPositionUnavailable(details={"position": position}) from error
 				raise
 			# UIA providers on NVDA 2026.1 can report an unavailable/empty selection
 			# as an exception. A selection with no selected text is the collapsed caret.
-			return obj.makeTextInfo(constants.POSITION_CARET)
+			try:
+				return obj.makeTextInfo(constants.POSITION_CARET)
+			except NotImplementedError as caret_error:
+				raise TextPositionUnavailable(details={"position": position}) from caret_error
 
 	def object_chunk(self, obj, offset, max_chars):
 		constants = self._constants()

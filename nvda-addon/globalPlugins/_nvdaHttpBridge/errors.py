@@ -53,6 +53,11 @@ class StaleState(Conflict):
 	default_message = "The resource changed since it was read"
 
 
+class TextPositionUnavailable(Conflict):
+	code = "textPositionUnavailable"
+	default_message = "The current NVDA object does not expose the requested text position"
+
+
 class RestartBlocked(Conflict):
 	code = "restartBlocked"
 	default_message = "NVDA cannot be safely restarted in the current UI state"

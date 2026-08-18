@@ -6,7 +6,7 @@ import unittest
 
 from support import GLOBAL_PLUGINS  # noqa: F401
 
-from _nvdaHttpBridge.errors import Conflict, GestureNotBound
+from _nvdaHttpBridge.errors import Conflict, GestureNotBound, TextPositionUnavailable
 from _nvdaHttpBridge.server import BoundedHTTPServer
 
 
@@ -22,6 +22,7 @@ class FakeService:
 		self.restart_calls = []
 		self.new_api_calls = []
 		self.action_error = None
+		self.text_error = None
 		self.server = None
 
 	def health(self):
@@ -94,6 +95,8 @@ class FakeService:
 
 	def current_text(self, position, params):
 		self.new_api_calls.append(("text-current", position, params))
+		if self.text_error is not None:
+			raise self.text_error
 		return {"position": position, "text": "selection"}
 
 	def object_text(self, object_id, params):
@@ -165,6 +168,20 @@ class BoundedHTTPServerTests(unittest.TestCase):
 		self.assertEqual(409, response.status)
 		self.assertEqual("gestureNotBound", payload["error"]["code"])
 		self.assertEqual("NVDA+control+upArrow", payload["error"]["details"]["key"])
+
+	def test_unavailable_text_position_returns_structured_conflict(self):
+		self.service.text_error = TextPositionUnavailable(details={"position": "caret"})
+		connection = self.connection()
+		try:
+			connection.request("GET", "/v1/text/caret")
+			response = connection.getresponse()
+			payload = json.loads(response.read().decode("utf-8"))
+		finally:
+			connection.close()
+
+		self.assertEqual(409, response.status)
+		self.assertEqual("textPositionUnavailable", payload["error"]["code"])
+		self.assertEqual({"position": "caret"}, payload["error"]["details"])
 
 	def connection(self):
 		return http.client.HTTPConnection(self.host, self.port, timeout=2)

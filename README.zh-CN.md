@@ -100,7 +100,7 @@ POST /v1/actions/set-caret
 POST /v1/actions/set-selection
 ```
 
-对象文本可按 NVDA 字符移动单位分页，默认 4096、单次最多 32768 字符，起点偏移最多 100000。写操作要求同一次读取返回的 `objectId`、`generation` 和 `revision`；插入点使用 `offset`，选择使用 `start`/`end`。焦点、文档或文本变化后返回 `409 staleObject`/`staleState`，客户端必须重新读取，不能自动重试。
+对象文本可按 NVDA 字符移动单位分页，默认 4096、单次最多 32768 字符，起点偏移最多 100000。写操作要求同一次读取返回的 `objectId`、`generation` 和 `revision`；插入点使用 `offset`，选择使用 `start`/`end`。焦点、文档或文本变化后返回 `409 staleObject`/`staleState`，客户端必须重新读取，不能自动重试。若当前 NVDA 对象不提供请求的插入点或选择文本位置，读取返回 `409 textPositionUnavailable`，而不是内部服务器错误。
 
 ## 只读清单与诊断导出
 

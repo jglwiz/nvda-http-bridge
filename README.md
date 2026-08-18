@@ -203,7 +203,7 @@ POST /v1/actions/set-caret
 POST /v1/actions/set-selection
 ```
 
-Object text is paged in NVDA character units. The default page size is 4,096 characters and the per-request maximum is 32,768. Caret and selection mutations require the `objectId`, `generation`, and `revision` from a fresh read. If focus, document, or text state changes, the server returns `409 staleObject` or `staleState`; reacquire the object instead of retrying blindly.
+Object text is paged in NVDA character units. The default page size is 4,096 characters and the per-request maximum is 32,768. Caret and selection mutations require the `objectId`, `generation`, and `revision` from a fresh read. If focus, document, or text state changes, the server returns `409 staleObject` or `staleState`; reacquire the object instead of retrying blindly. If the current NVDA object exposes no requested caret or selection position, the read returns `409 textPositionUnavailable` instead of an internal server error.
 
 ## Bounded accessibility trees
 
