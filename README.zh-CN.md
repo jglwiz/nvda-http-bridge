@@ -64,7 +64,7 @@ _nvdaHttpBridge/
 .\build.ps1
 ```
 
-产物写入 `release/nvdaHttpBridge-0.1.0.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
+产物写入 `release/nvdaHttpBridge-0.2.0.nvda-addon`，构建脚本会排除 `__pycache__` 和 `.pyc`。
 
 所有接口都不要求凭据。访问边界仅由 `127.0.0.1` 监听、Host/浏览器来源检查、安全桌面限制、严格 schema 与资源限制构成。旧版本遗留的 `%APPDATA%\nvda\nvdaHttpBridge.token` 不再读取或创建。
 

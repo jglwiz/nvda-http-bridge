@@ -52,7 +52,7 @@ The client only connects to `http://127.0.0.1:<port>` and sends no credentials. 
 `backup --output PATH` sends normalized `PATH` as the required `targetPath`. The plugin creates `<PATH>/nvda`, including missing target parents, calls NVDA's internal portable-copy implementation with current configuration, refuses an existing child, excludes any legacy Bridge credential file, and returns the resulting directory as `backupPath`. Deleting or expiring the HTTP job preserves the completed backup.
 - Events: `GET /v1/events`; the client defaults to 5 seconds and at most 50 events. Use `--last-event-id` to resume after a previously returned ID.
 
-Query the live `capabilities` endpoint before assuming limits. Version 0.1.0 defaults are depth 3, 20 children per parent, 200 nodes, and 500 ms. Synchronous hard limits are depth 10, 200 children, 1000 nodes, 3000 ms, and 2 MiB. Exports retain emergency caps of depth 100, 10,000 children, 1,000,000 nodes, 100 MiB per job, 200 MiB total, and 300 seconds.
+Query the live `capabilities` endpoint before assuming limits. Version 0.2.0 defaults are depth 3, 20 children per parent, 200 nodes, and 500 ms. Synchronous hard limits are depth 10, 200 children, 1000 nodes, 3000 ms, and 2 MiB. Exports retain emergency caps of depth 100, 10,000 children, 1,000,000 nodes, 100 MiB per job, 200 MiB total, and 300 seconds.
 
 Text defaults to 4096 characters per response, permits at most 32768 characters and an object-relative offset of 100000. `set-caret` requires `objectId`, `generation`, `baseRevision`, and `offset`; `set-selection` replaces `offset` with `start` and `end`. Native provider bookmarks never cross HTTP. Re-read after `staleObject` or `staleState`.
 
